@@ -14,6 +14,14 @@ MegaBlocks dMoEs outperform MoEs trained with [Tutel](https://github.com/microso
 
 NOTE: This assumes you have `numpy` and `torch` installed.
 
+**Variable-Size Experts:** To use variable-size MoEs (experts with different sizes), install from this fork with:
+
+```bash
+pip install -e .[all]
+```
+
+This will build the `nanomoe_ops` CUDA extension which provides the `indices_variable` operation for variable-size expert routing.
+
 **Training models with Megatron-LM:** We recommend using NGC's [`nvcr.io/nvidia/pytorch:23.09-py3`](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch/tags) PyTorch container. The [Dockerfile](Dockerfile) builds on this image with additional dependencies. To build the image, run `docker build . -t megablocks-dev` and then `bash docker.sh` to launch the container. Once inside the container, install MegaBlocks with `pip install .`. See [Usage](#steam_locomotive-usage) for instructions on training MoEs with MegaBlocks + Megatron-LM.
 
 **Using MegaBlocks in other packages:** To install the MegaBlocks package for use in other frameworks, run `pip install megablocks`. For example, [Mixtral-8x7B](https://mistral.ai/news/mixtral-of-experts/) can be run with [vLLM](https://github.com/vllm-project/vllm) + MegaBlocks with this installation method.

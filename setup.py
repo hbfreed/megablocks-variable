@@ -62,7 +62,7 @@ classifiers = [
 install_requires = [
     'numpy>=1.21.5,<2.1.0',
     'packaging>=21.3.0,<24.2',
-    'torch>=2.7.0,<2.7.1',
+    'torch>=2.7.0',
     'stanford-stk==0.7.1',
 ]
 
@@ -110,6 +110,15 @@ if 'cu' in torch.__version__ and CUDA_HOME is not None:
         CUDAExtension(
             'megablocks_ops',
             ['csrc/ops.cu'],
+            include_dirs=['csrc'],
+            extra_compile_args={
+                'cxx': ['-fopenmp'],
+                'nvcc': nvcc_flags,
+            },
+        ),
+        CUDAExtension(
+            'nanomoe_ops',
+            ['csrc/nanomoe_ops.cu'],
             include_dirs=['csrc'],
             extra_compile_args={
                 'cxx': ['-fopenmp'],
