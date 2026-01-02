@@ -16,7 +16,8 @@ InitFn = Union[Callable[[torch.Tensor], None], partial[torch.Tensor]]
 
 _ALLOWED_BITWIDTHS = (-1, 4, 8)
 
-DEFAULT_ACTIVATION_FN = partial(F.gelu, approximate='tanh')
+DEFAULT_ACTIVATION_FN = partial(F.gelu, approximate="tanh")
+SILU_ACTIVATION_FN = F.silu
 
 
 @dataclasses.dataclass
