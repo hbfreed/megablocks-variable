@@ -1,0 +1,602 @@
+"""
+GPT model (rewrite, a lot simpler)
+Notable features:
+- rotary embeddings (and no positional embeddings)
+- QK norm
+- untied weights for token embedding and lm_head
+- relu^2 activation in MLP
+- norm after token embedding
+- no learnable params in rmsnorm
+- no bias in linear layers
+- Multi-Query Attention (MQA) support for more efficient inference
+"""
+
+import math
+from dataclasses import dataclass, field
+from typing import Any
+
+import stk
+import stk.ops
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
+from megablocks import ops
+from megablocks.layers.relu_squared import relu_squared
+
+# Import nanomoe_ops for variable-size topology
+try:
+    import nanomoe_ops
+except ModuleNotFoundError:
+    nanomoe_ops = None
+
+
+class TopologyVarOp(torch.autograd.Function):
+    """Topology construction for variable-size experts."""
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        padded_bins: torch.Tensor,
+        expert_block_counts: torch.Tensor,
+        expert_block_offsets: torch.Tensor,
+        block_size: int,
+        output_block_rows: int,
+    ):
+        prepend = padded_bins.new_zeros(1)
+        bin_sizes = torch.diff(padded_bins, prepend=prepend)
+        expert_token_blocks = (bin_sizes // block_size).to(torch.int32)
+
+        expert_output_sizes = expert_token_blocks * expert_block_counts.to(torch.int32)
+        total_nnz = expert_output_sizes.sum().item()
+
+        if total_nnz == 0:
+            return torch.empty(0, dtype=torch.int16, device=padded_bins.device)
+
+        cumsum = expert_output_sizes.cumsum(0)
+        output_offsets_tensor = torch.cat([
+            torch.zeros(1, dtype=torch.int32, device=padded_bins.device),
+            cumsum[:-1]
+        ]).to(torch.int32)
+
+        out = torch.empty(total_nnz, dtype=torch.int16, device=padded_bins.device)
+
+        if nanomoe_ops is not None:
+            nanomoe_ops.indices_variable(
+                padded_bins,
+                expert_block_counts,
+                expert_block_offsets,
+                output_offsets_tensor,
+                block_size,
+                output_block_rows,
+                out,
+            )
+        else:
+            raise RuntimeError("nanomoe_ops not available. Build the extension first.")
+
+        return out
+
+
+def topology_var(
+    padded_bins: torch.Tensor,
+    expert_block_counts: torch.Tensor,
+    expert_block_offsets: torch.Tensor,
+    block_size: int,
+    output_block_rows: int,
+) -> torch.Tensor:
+    """Construct variable-size expert topology."""
+    return TopologyVarOp.apply(
+        padded_bins,
+        expert_block_counts,
+        expert_block_offsets,
+        block_size,
+        output_block_rows,
+    )
+
+
+@dataclass
+class GPTConfig:
+    sequence_len: int = 1024
+    vocab_size: int = 50304
+    n_layer: int = 12
+    n_head: int = 6  # number of query heads
+    n_kv_head: int = 6  # number of key/value heads (MQA)
+    n_embd: int = 768
+    use_moe: bool = True
+    expert_sizes: list = field(
+        default_factory=lambda: [(64, 256)]
+    )  # 64 fine-grained experts
+    num_active_experts: int = 8
+    norm_topk_prob: bool = True
+    load_balance_loss_weight: float = 0.08
+    router_z_loss_weight: float = 0.001
+    compute_loss_weight: float = 0.004
+
+
+def norm(x):
+    # Purely functional rmsnorm with no learnable params
+    return F.rms_norm(x, (x.size(-1),))
+
+
+def apply_rotary_emb(x, cos, sin):
+    assert x.ndim == 4  # multihead attention
+    d = x.shape[3] // 2
+    x1, x2 = x[..., :d], x[..., d:]  # split up last time into two halves
+    y1 = x1 * cos + x2 * sin  # rotate pairs of dims
+    y2 = x1 * (-sin) + x2 * cos
+    out = torch.cat([y1, y2], 3)  # re-assemble
+    out = out.to(x.dtype)  # ensure input/output dtypes match
+    return out
+
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.n_head = config.n_head
+        self.n_kv_head = config.n_kv_head
+        self.n_embd = config.n_embd
+        self.head_dim = self.n_embd // self.n_head
+        assert self.n_embd % self.n_head == 0
+        assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
+        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
+        self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+
+    def forward(self, x, cos_sin, kv_cache=None):
+        B, T, C = x.size()
+
+        # Project the input to get queries, keys, and values
+        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
+        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+
+        # Apply Rotary Embeddings to queries and keys to get relative positional encoding
+        cos, sin = cos_sin
+        q, k = (
+            apply_rotary_emb(q, cos, sin),
+            apply_rotary_emb(k, cos, sin),
+        )  # QK rotary embedding
+        q, k = norm(q), norm(k)  # QK norm
+        q, k, v = (
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+        )  # make head be batch dim, i.e. (B, T, H, D) -> (B, H, T, D)
+
+        # Apply KV cache: insert current k,v into cache, get the full view so far
+        if kv_cache is not None:
+            k, v = kv_cache.insert_kv(self.layer_idx, k, v)
+        Tq = q.size(2)  # number of queries in this forward pass
+        Tk = k.size(2)  # number of keys/values in total
+
+        # Attention
+        enable_gqa = self.n_head != self.n_kv_head
+        if kv_cache is None or Tq == Tk:
+            y = F.scaled_dot_product_attention(
+                q, k, v, is_causal=True, enable_gqa=enable_gqa
+            )
+        elif Tq == 1:
+            y = F.scaled_dot_product_attention(
+                q, k, v, is_causal=False, enable_gqa=enable_gqa
+            )
+        else:
+            attn_mask = torch.zeros((Tq, Tk), dtype=torch.bool, device=q.device)
+            prefix_len = Tk - Tq
+            if prefix_len > 0:
+                attn_mask[:, :prefix_len] = True
+            attn_mask[:, prefix_len:] = torch.tril(
+                torch.ones((Tq, Tq), dtype=torch.bool, device=q.device)
+            )
+            y = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa
+            )
+
+        y = y.transpose(1, 2).contiguous().view(B, T, -1)
+        y = self.c_proj(y)
+        return y
+
+
+class MLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = F.relu(x).square()
+        x = self.c_proj(x)
+        return x, None, None
+
+
+class MoEMLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.num_experts = sum(count for count, _ in config.expert_sizes)
+        self.num_active_experts = config.num_active_experts
+        self.norm_topk_prob = config.norm_topk_prob
+        self.block_size = 128
+
+        self.expert_widths = []
+        self.expert_offsets = [0]
+        for count, size in config.expert_sizes:
+            assert size % 128 == 0, "expert sizes must be divisible by 128"
+            for _ in range(count):
+                self.expert_widths.append(size)
+                self.expert_offsets.append(self.expert_offsets[-1] + size)
+        self.total_expert_width = self.expert_offsets[-1]
+
+        mean_expert_width = sum(self.expert_widths) / self.num_experts
+        self.register_buffer(
+            "expert_widths_normalized",
+            torch.tensor(
+                [w / mean_expert_width for w in self.expert_widths], dtype=torch.float32
+            ),
+            persistent=False,
+        )
+
+        self.router = nn.Linear(config.n_embd, self.num_experts, bias=False)
+
+        self.w1 = nn.Parameter(torch.empty(config.n_embd, self.total_expert_width))
+        self.w2 = nn.Parameter(torch.empty(self.total_expert_width, config.n_embd))
+
+        nn.init.trunc_normal_(self.w1, mean=0.0, std=0.02, a=-0.06, b=0.06)
+        nn.init.trunc_normal_(self.w2, mean=0.0, std=0.02, a=-0.06, b=0.06)
+
+        self.sort_end_bit = max(int(math.ceil(math.log2(self.num_experts))), 1)
+        self.transpose_sort_end_bit = max(
+            int(math.ceil(math.log2(self.num_experts))), 1
+        )
+
+        self.register_buffer(
+            "expert_size_blocks",
+            torch.tensor(
+                [s // self.block_size for s in self.expert_widths], dtype=torch.int32
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "expert_block_offsets",
+            torch.tensor(
+                [o // self.block_size for o in self.expert_offsets], dtype=torch.int32
+            ),
+            persistent=False,
+        )
+
+    @torch.compiler.disable
+    def forward(self, x):
+        batch_size, seq_len, n_embd = x.shape
+
+        x_flat = rearrange(
+            x, "batch_size seq_len n_embd -> (batch_size seq_len) n_embd "
+        )
+
+        router_logits = self.router(x_flat)
+        router_probs = F.sigmoid(router_logits.to(torch.float32))
+
+        top_k_weights, selected_experts = torch.topk(
+            router_probs, self.num_active_experts, dim=-1
+        )
+
+        top_k_weights = top_k_weights / (
+            top_k_weights.sum(dim=-1, keepdim=True) + 1e-20
+        )
+        top_k_weights = top_k_weights.to(x.dtype)
+
+        top_k_weights_flat = rearrange(top_k_weights, "... -> (...)")
+        selected_experts_flat = rearrange(selected_experts, "... -> (...)")
+
+        bin_ids, indices, tokens_per_expert = self._sort_tokens_by_expert(
+            selected_experts_flat
+        )
+        padded_bins, topology = self._create_topology(x_flat, tokens_per_expert)
+        x_permuted = self._gather_tokens(
+            x_flat, indices, bin_ids, tokens_per_expert, padded_bins
+        )
+        x_permuted = stk.ops.sdd(x_permuted, self.w1, topology)
+        x_permuted = relu_squared(x_permuted)
+        x_permuted = stk.ops.dsd(x_permuted, self.w2)
+        x_permuted = self._scatter_tokens(
+            x_permuted,
+            indices,
+            bin_ids,
+            top_k_weights_flat,
+            tokens_per_expert,
+            padded_bins,
+        )
+        output = rearrange(
+            x_permuted,
+            "(batch_size seq_len) n_embd -> batch_size seq_len n_embd",
+            batch_size=batch_size,
+            seq_len=seq_len,
+        )
+
+        router_z_loss = torch.logsumexp(router_logits, dim=-1).pow(2).mean()
+
+        # Reuse tokens_per_expert from histogram instead of expensive scatter_add_
+        # f_i = fraction of tokens assigned to each expert
+        f_i = (tokens_per_expert.float() / tokens_per_expert.sum()).to(x.dtype)
+        load_balance_loss = self._compute_load_balance_loss(
+            router_probs, selected_experts_flat, f_i
+        )
+        router_probs_flat = rearrange(
+            router_probs,
+            "(batch_size seq_len) n_embd -> (batch_size seq_len) n_embd",
+            batch_size=batch_size,
+            seq_len=seq_len,
+        )
+        compute_loss = (
+            router_probs_flat
+            @ self.expert_widths_normalized.to(router_probs_flat.dtype)
+        ).mean()
+
+        aux_loss = {
+            "router_z_loss": router_z_loss,
+            "load_balance_loss": load_balance_loss,
+            "compute_loss": compute_loss,
+        }
+
+        return output, aux_loss, f_i
+
+    def _sort_tokens_by_expert(self, selected_experts_flat):
+        bin_ids, indices = ops.sort(selected_experts_flat, self.sort_end_bit)
+        tokens_per_expert = ops.histogram(selected_experts_flat, self.num_experts)
+        return bin_ids, indices, tokens_per_expert
+
+    def _create_topology(self, x, tokens_per_expert):
+        padded_tokens_per_expert = ops.round_up(tokens_per_expert, self.block_size)
+        padded_bins = ops.inclusive_cumsum(padded_tokens_per_expert, 0)
+        padded_bins = padded_bins.contiguous()
+
+        padded_tokens = padded_bins[-1].clamp_min(self.block_size)
+        block_rows = padded_tokens // self.block_size
+
+        column_indices = topology_var(
+            padded_bins,
+            self.expert_size_blocks,
+            self.expert_block_offsets,
+            self.block_size,
+            block_rows,
+        )
+
+        prepend = padded_bins.new_zeros(1)
+        bin_sizes = torch.diff(padded_bins, prepend=prepend)
+        expert_token_blocks = bin_sizes // self.block_size
+
+        repeated_sizes = torch.repeat_interleave(
+            self.expert_size_blocks, expert_token_blocks
+        )
+        offsets = torch.cat([repeated_sizes.new_zeros(1), repeated_sizes.cumsum(0)])
+
+        column_indices = column_indices.to(torch.int32)
+        offsets = offsets.to(torch.int32)
+
+        shape = (padded_tokens, self.total_expert_width)
+
+        num_blocks = column_indices.numel()
+        data_placeholder = torch.empty(
+            num_blocks,
+            self.block_size,
+            self.block_size,
+            dtype=x.dtype,
+            device="meta",
+        )
+
+        row_indices = stk.ops.row_indices(
+            shape, data_placeholder, offsets, column_indices
+        )
+        row_indices = row_indices.to(torch.int32)
+
+        column_indices_t, offsets_t, block_offsets_t = self._sparse_transpose(
+            shape, row_indices, column_indices
+        )
+        column_indices_t = column_indices_t.to(torch.int32)
+        offsets_t = offsets_t.to(torch.int32)
+        block_offsets_t = block_offsets_t.to(torch.int32)
+
+        topology = stk.Matrix(
+            shape,
+            data_placeholder,
+            row_indices,
+            column_indices,
+            offsets,
+            column_indices_t,
+            offsets_t,
+            block_offsets_t,
+        )
+
+        return padded_bins, topology
+
+    def _sparse_transpose(self, size, row_indices, column_indices):
+        block_columns = self.total_expert_width // self.block_size
+
+        _, gather_indices = ops.sort(
+            column_indices.int(),
+            self.transpose_sort_end_bit,
+        )
+
+        column_indices_t = row_indices.gather(0, gather_indices.long())
+        block_offsets_t = gather_indices.int()
+
+        zero = torch.zeros((1,), dtype=torch.int32, device=row_indices.device)
+        nnz_per_column = ops.histogram(column_indices, block_columns)
+        nnz_per_column = ops.inclusive_cumsum(nnz_per_column, 0)
+        if nnz_per_column.dim() == 0:
+            nnz_per_column = nnz_per_column.unsqueeze(0)
+        offsets_t = torch.cat([zero, nnz_per_column])
+        return column_indices_t, offsets_t, block_offsets_t
+
+    def _gather_tokens(self, x, indices, bin_ids, tokens_per_expert, padded_bins):
+        bins = ops.inclusive_cumsum(tokens_per_expert, 0)
+        bins = bins.contiguous()
+        return ops.padded_gather(
+            x, indices, bin_ids, bins, padded_bins, self.num_active_experts
+        )
+
+    def _scatter_tokens(
+        self, x, indices, bin_ids, weights, tokens_per_expert, padded_bins
+    ):
+        bins = ops.inclusive_cumsum(tokens_per_expert, 0)
+        bins = bins.contiguous()
+        return ops.padded_scatter(
+            x, indices, bin_ids, weights, bins, padded_bins, self.num_active_experts
+        )
+
+    def _compute_load_balance_loss(self, router_probs, experts_flat, f_i):
+        p_i = router_probs.mean(dim=0).to(torch.float32)
+        f_i = f_i.to(torch.float32)
+
+        if len(set(self.expert_widths)) == 1:
+            return self.num_experts * (f_i @ p_i)
+
+        expert_sizes_spec = getattr(self.config, "expert_sizes", None)
+        if expert_sizes_spec is None:
+            return self.num_experts * (f_i @ p_i)
+
+        group_losses = []
+        expert_idx = 0
+        for count, size in expert_sizes_spec:
+            group_indices = list(range(expert_idx, expert_idx + count))
+            expert_idx += count
+
+            if count > 1:
+                group_f_i = f_i[group_indices]
+                group_p_i = p_i[group_indices]
+                group_loss = count * (group_f_i @ group_p_i)
+                group_losses.append(group_loss)
+
+        return sum(group_losses) / len(group_losses) if group_losses else f_i @ p_i
+
+
+class Block(nn.Module):
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.attn = CausalSelfAttention(config, layer_idx)
+        if config.use_moe:
+            self.mlp = MoEMLP(config)
+        else:
+            self.mlp = MLP(config)
+
+    def forward(self, x, cos_sin, kv_cache=None):
+        x = x + self.attn(norm(x), cos_sin, kv_cache)
+        mlp_x, aux_loss, f_i = self.mlp(norm(x))
+        x = x + mlp_x
+        return x, aux_loss, f_i
+
+
+class GPT(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.transformer = nn.ModuleDict(
+            {
+                "wte": nn.Embedding(config.vocab_size, config.n_embd),
+                "h": nn.ModuleList(
+                    [Block(config, layer_idx) for layer_idx in range(config.n_layer)]
+                ),
+            }
+        )
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.rotary_seq_len = config.sequence_len * 10
+        head_dim = config.n_embd // config.n_head
+        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        self.register_buffer("cos", cos, persistent=False)
+        self.register_buffer("sin", sin, persistent=False)
+
+    def init_weights(self):
+        self.apply(self._init_weights)
+        torch.nn.init.zeros_(self.lm_head.weight)
+        for block in self.transformer.h:
+            if hasattr(block.mlp, "c_proj"):
+                torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            torch.nn.init.zeros_(block.attn.c_proj.weight)
+        head_dim = self.config.n_embd // self.config.n_head
+        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        self.cos, self.sin = cos, sin
+        if self.transformer.wte.weight.device.type == "cuda":
+            self.transformer.wte.to(dtype=torch.bfloat16)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            fan_out = module.weight.size(0)
+            fan_in = module.weight.size(1)
+            std = 1.0 / math.sqrt(fan_in) * min(1.0, math.sqrt(fan_out / fan_in))
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=1.0)
+
+    def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
+        if device is None:
+            device = self.transformer.wte.weight.device
+        channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
+        inv_freq = 1.0 / (base ** (channel_range / head_dim))
+        t = torch.arange(seq_len, dtype=torch.float32, device=device)
+        freqs = torch.outer(t, inv_freq)
+        cos, sin = freqs.cos(), freqs.sin()
+        cos, sin = cos.bfloat16(), sin.bfloat16()
+        cos, sin = cos[None, :, None, :], sin[None, :, None, :]
+        return cos, sin
+
+    def forward(self, idx, targets=None, kv_cache=None):
+        B, T = idx.size()
+
+        assert T <= self.cos.size(1)
+        cos_sin = (self.cos[:, :T], self.sin[:, :T])
+
+        x = self.transformer.wte(idx)
+        x = norm(x)
+
+        combined_aux_loss = None
+        aux_loss_count = 0
+        for block in self.transformer.h:
+            x, aux_loss, f_i = block(x, cos_sin, kv_cache)
+
+            if aux_loss is not None:
+                if combined_aux_loss is None:
+                    combined_aux_loss = {k: v.clone() for k, v in aux_loss.items()}
+                else:
+                    for key in aux_loss:
+                        combined_aux_loss[key] += aux_loss[key]
+                aux_loss_count += 1
+
+        if combined_aux_loss is not None and aux_loss_count > 0:
+            for key in combined_aux_loss:
+                combined_aux_loss[key] /= aux_loss_count
+
+        x = norm(x)
+
+        softcap = 15
+        if targets is not None:
+            logits = self.lm_head(x)
+            logits = softcap * torch.tanh(logits / softcap)
+            logits = logits.float()
+            ce_loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=-1,
+            )
+            loss = ce_loss
+            if combined_aux_loss is not None:
+                loss = (
+                    loss
+                    + self.config.load_balance_loss_weight
+                    * combined_aux_loss["load_balance_loss"]
+                    + self.config.router_z_loss_weight
+                    * combined_aux_loss["router_z_loss"]
+                )
+                if self.config.compute_loss_weight > 0:
+                    loss = (
+                        loss
+                        + self.config.compute_loss_weight
+                        * combined_aux_loss["compute_loss"]
+                    )
+            return logits, loss, combined_aux_loss
+        else:
+            logits = self.lm_head(x)
+            logits = softcap * torch.tanh(logits / softcap)
+            return logits

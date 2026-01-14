@@ -6,6 +6,49 @@
 requires = ["setuptools < 79.0.0", "torch >= 2.7.0, < 2.7.1"]
 build-backend = "setuptools.build_meta"
 
+[project]
+name = "megablocks"
+version = "0.11.0.dev0"
+description = "MegaBlocks: Efficient Sparse Training with Mixture-of-Experts"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "Trevor Gale", email = "tgale@stanford.edu"},
+]
+dependencies = [
+    "numpy>=1.21.5,<2.1.0",
+    "packaging>=21.3.0",
+    "torch>=2.7.0",
+    "stanford-stk==0.7.1",
+    "einops",
+]
+
+[project.optional-dependencies]
+gg = [
+    "grouped_gemm==0.3.0",
+]
+dev = [
+    "absl-py",
+    "coverage[toml]==7.4.4",
+    "pytest_codeblocks>=0.16.1,<0.17",
+    "pytest-cov>=4,<5",
+    "pytest>=7.2.1,<8",
+    "pre-commit>=3.4.0,<4",
+]
+testing = [
+    "mosaicml>=0.24.1",
+]
+all = [
+    "grouped_gemm==0.3.0",
+    "absl-py",
+    "coverage[toml]==7.4.4",
+    "pytest_codeblocks>=0.16.1,<0.17",
+    "pytest-cov>=4,<5",
+    "pytest>=7.2.1,<8",
+    "pre-commit>=3.4.0,<4",
+]
+
 # Pytest
 [tool.pytest.ini_options]
 # By default, run tests in README codeblocks, raise typos in fixtures as errors,
