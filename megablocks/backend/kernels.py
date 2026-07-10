@@ -231,6 +231,48 @@ def gather(x, indices, bin_ids, weights, bins, top_k):
     return out
 
 
+# One threadblock per output token. Each accumulates that token's TOP_K scattered
+# rows directly in fp32 registers, so we never materialize the (tokens, top_k,
+# hidden) intermediate that a separate .sum(dim=1) would then have to re-read.
+# inv is the inverse of `indices`: inv[dest] = sorted position holding it.
+@triton.autotune(
+    configs=_COPY_CONFIGS,
+    key=['NUM_COLUMNS'],
+)
+@triton.jit
+def _scatter_reduce(
+    out,
+    x,
+    inv,
+    bin_ids,
+    weights,
+    bins,
+    padded_bins,
+    NUM_COLUMNS: tl.constexpr,
+    TOP_K: tl.constexpr,
+    BLOCK_X: tl.constexpr,
+    SCALE: tl.constexpr,
+):
+    token = tl.program_id(0)
+    out_ptr = out + token * NUM_COLUMNS
+    for col_base in range(0, NUM_COLUMNS, BLOCK_X):
+        cols = col_base + tl.arange(0, BLOCK_X)
+        mask = cols < NUM_COLUMNS
+        acc = tl.zeros((BLOCK_X,), dtype=tl.float32)
+        for k in range(TOP_K):
+            dest = token * TOP_K + k
+            pid = tl.load(inv + dest)
+            b = tl.load(bin_ids + pid)
+            prev_bin = tl.load(bins + b - 1, mask=b > 0, other=0)
+            prev_pad = tl.load(padded_bins + b - 1, mask=b > 0, other=0)
+            src_row = (pid - prev_bin) + prev_pad
+            v = tl.load(x + src_row * NUM_COLUMNS + cols, mask=mask).to(tl.float32)
+            if SCALE:
+                v = v * tl.load(weights + dest).to(tl.float32)
+            acc += v
+        tl.store(out_ptr + cols, acc.to(out.dtype.element_ty), mask=mask)
+
+
 def padded_scatter(x, indices, bin_ids, weights, bins, padded_bins, top_k):
     # Validate the input shapes.
     assert_is_matrix(x)
@@ -245,7 +287,34 @@ def padded_scatter(x, indices, bin_ids, weights, bins, padded_bins, top_k):
         assert_equal(indices.shape[0], weights.shape[0])
 
     tokens = indices.shape[0] // top_k
-    out = torch.empty((tokens, top_k, x.shape[1]), dtype=x.dtype, device=x.device)
+
+    if top_k > 1:
+        # Fused scatter + top-k reduction (see _scatter_reduce). This both scales
+        # (when weights are given) and sums the top_k contributions per token,
+        # accumulating in fp32, so it replaces the copy + .sum(dim=1) and avoids
+        # the 8x (top_k) intermediate. Accumulating in fp32 is also slightly more
+        # accurate than summing the bf16 intermediate the old path produced.
+        inv = torch.empty_like(indices)
+        inv[indices.long()] = torch.arange(
+            indices.shape[0], device=indices.device, dtype=indices.dtype
+        )
+        out = torch.empty((tokens, x.shape[1]), dtype=x.dtype, device=x.device)
+        _scatter_reduce[(tokens,)](
+            out,
+            x,
+            inv,
+            bin_ids,
+            weights,
+            bins,
+            padded_bins,
+            NUM_COLUMNS=x.shape[1],
+            TOP_K=top_k,
+            SCALE=weights is not None,
+        )
+        return out
+
+    # top_k == 1: no reduction, so the direct copy is fastest.
+    out = torch.empty((tokens, 1, x.shape[1]), dtype=x.dtype, device=x.device)
     _padded_copy[(indices.shape[0],)](
         out,
         x,
@@ -259,9 +328,7 @@ def padded_scatter(x, indices, bin_ids, weights, bins, padded_bins, top_k):
         TOP_K=top_k,
         SCALE=weights is not None,
     )
-
-    # Reduce along the top-k dimension, if needed.
-    return out.sum(dim=1) if top_k > 1 else out.view(tokens, x.shape[1])
+    return out.view(tokens, x.shape[1])
 
 
 def scatter(x, indices, bin_ids, weights, bins, top_k):
