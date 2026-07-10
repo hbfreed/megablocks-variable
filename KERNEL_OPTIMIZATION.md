@@ -1,111 +1,116 @@
-# Variable-MoE kernel optimization
+# Variable-MoE: correctness fix + kernel optimization
 
-Goal: make the MoE kernels in this fork faster. Target is the variable-size
-`MoEMLP` (`gpt_model.py`) exercised by `profile_moe.py --variable-only`.
+Work on the variable-size `MoEMLP` (`gpt_model.py`) exercised by
+`profile_moe.py --variable-only`. Two independent outcomes:
 
-**Result: 10.4 ms → 7.35 ms per fwd+bwd step (1.41×, −29%); ~790k → ~1.12M tokens/s.**
-Output, all three aux losses, and every gradient are **bit-identical** to the
-original (0.0 error) across four configs: variable-size experts, uniform experts,
-`top_k=1`, and 512-wide experts.
+1. **Correctness:** fixed a latent bug that produced **wrong expert weight
+   gradients** for any expert wider than 128 (i.e. every real config).
+2. **Speed:** **10.4 ms → 6.85 ms per fwd+bwd step (1.52×, −34%)**; ~790k →
+   ~1.20M tokens/s.
 
 Benchmark config: RTX 3090 (Ampere), bf16, batch 8 × seq 1024, hidden 768,
 64 experts, ffn 256/expert, top_k 8.
 
-## How the time was actually spent
+---
 
-Profiling showed the step was **launch/sync-bound**, not compute-bound. GPU-busy
-time was ~5.75 ms but wall time ~10.4 ms. The tell (from the pipelining probe):
+## 1. Correctness bug: corrupted expert weight gradients
 
-| measurement | original | optimized |
+`transpose_sort_end_bit` was sized to `ceil(log2(num_experts))`. But the sparse
+**transpose** sorts *column-block* indices, whose range is the number of
+column-blocks = `total_expert_width / block_size`, not `num_experts`. Once an
+expert spans more than one 128-block, that range exceeds `num_experts`, so the
+radix sort ran with too few bits and **silently dropped the high bits**,
+mis-grouping the transpose. The transpose feeds the `dds` op that computes the
+expert weight gradients, so `w1.grad` / `w2.grad` came out wrong.
+
+It was **silent**: the forward output and the input gradient (`x.grad`) don't use
+the transpose, so they stayed correct — loss still decreased and the router / rest
+of the network trained fine. Only the experts themselves got bad gradients.
+
+Detected by comparing against a dense fp32 ground-truth MoE:
+
+| tensor | before | after |
 |---|---|---|
-| forward-only, isolated | 3.24 ms | 2.92 ms |
-| full step, serialized (CUDA events) | 8.59 ms | 7.31 ms |
-| **full step, pipelined (real training loop)** | **10.44 ms** | **6.93 ms** |
+| output | 2e-3 ✓ | 2e-3 ✓ |
+| x.grad | 2e-3 ✓ | 2e-3 ✓ |
+| **w1.grad** | **1.13 (garbage)** | **2e-3 ✓** |
+| **w2.grad** | **1.26 (garbage)** | **2e-3 ✓** |
 
-In the original, the *pipelined* loop is **slower** than the *serialized* one —
-a signature of a CPU/sync bottleneck: hidden host↔device syncs stall the CPU so
-it can't queue the next step's work while the GPU runs. After the changes this
-inverts to healthy pipelining (wall < serialized). Note the isolated forward
-barely changed (3.24→2.92) while the pipelined step dropped 3.5 ms — the win is
-removing serialization, not raw compute.
+(The ~2e-3 floor is Ampere TF32 matmul, not error.) Confirmed it triggers only
+when experts are wider than one block: `(8,128)` experts are correct, `(4,256)`
+are not. Upstream `megablocks/layers/dmoe.py` sizes this correctly
+(`ffn_hidden_size * num_experts // blocking`); the fork regressed it when adapting
+to variable sizes. The fused topology kernel below removes the sort entirely, so
+the final code is correct by construction.
 
-A per-stage forward breakdown found the culprit. **Topology construction was the
-single biggest forward stage — 1.36 ms — despite producing only integer index
-tensors.** Inside it, two ops that do no real math dominated:
+> The same bug exists in **variable-flex-olmo** (`megablocks_core.py`). **variable-reap**
+> uses HF OLMoE looped experts (not this block-sparse path) and is unaffected.
 
-- `torch.repeat_interleave(sizes, counts)` — **0.44 ms**, entirely a hidden device
-  sync (it must learn the output length before it can allocate).
-- `TopologyVarOp` `.item()` on `total_nnz` plus a 0-d-tensor→`int` conversion for
-  the grid size — **~0.3 ms** of pipeline drain; the CUDA kernel itself is tiny.
+## 2. The step was sync/launch-bound, not compute-bound
 
-## Changes
+GPU-busy time was ~5.75 ms but wall ~10.4 ms. In the original, the *pipelined*
+training loop (10.4 ms) was **slower** than a *serialized* isolated step (8.6 ms) —
+the signature of hidden host↔device syncs starving the CPU. Topology construction
+was the biggest forward stage (1.36 ms) despite only building integer index
+tensors, dominated by two ops that do no math:
 
-### 1. `padded_gather`: zero only the padding, not the whole buffer (`megablocks/backend/kernels.py`)
-The gather output is padded per expert (rounded up to the 128 block size), so it
-was allocated with `torch.zeros`. But only ~6% of the rows are padding — the copy
-overwrites the other ~94% immediately. Zeroing all of it wrote ~113 MB/call for
-nothing. Replaced with `torch.empty` + a tiny `_zero_padding` kernel that zeros
-only the per-expert padding gaps.
+- `torch.repeat_interleave(sizes, counts)` — a hidden device sync (learns the
+  output length before allocating).
+- `TopologyVarOp`'s `.item()` on `total_nnz` — pipeline drain; the kernel is tiny.
 
-Padding *must* stay zero (the backward weight-grad `dds` sums over all padded
-rows and relies on `padding × grad == 0`; garbage would give `Inf×0 = NaN`), so
-`torch.empty` alone would be wrong — hence the targeted zeroing.
+## 3. Changes
 
-*Isolated:* gather 0.561→0.456 ms. *Profiler:* `PaddedGatherOp` CUDA 17.5→11.9 ms.
+### a. Fixed the weight-grad bug (§1)
+Immediate fix sized `transpose_sort_end_bit` to the column-block count; superseded
+by the fused kernel (c) which does no sort.
 
-### 2. `repeat_interleave` made sync-free (`gpt_model.py::_create_topology`)
-Passed `output_size=` (the row-block count, already known) so it no longer syncs
-to discover the length. *Isolated:* 0.437→0.012 ms.
+### b. Removed host↔device syncs
+- `_create_topology` now pulls `padded_bins` to the host **once** (`.tolist()`) and
+  derives every python-int size (last bin, row-block count, `total_nnz`) from it.
+- Deduplicated the `bins` cumsum shared by gather and scatter.
 
-### 3. `total_nnz` computed host-side (`gpt_model.py::TopologyVarOp`, `_create_topology`)
-The topology build needs `padded_bins[-1]` on the host anyway (to size buffers).
-We now pull `padded_bins` to the host **once** (`.tolist()`) and derive every
-python-int size — last bin, row-block count, and `total_nnz` — from it, then hand
-`total_nnz` to `TopologyVarOp` so it skips its own `.item()` sync. The host-side
-sum is integer-exact with the device reduction it replaces. Also removes the
-implicit 0-d-tensor→`int` sync by passing `block_rows` as a python int.
+### c. Fused topology kernel (`csrc/indices.h::build_topology`)
+The variable-MoE topology is **block-diagonal-dense per expert** — each of an
+expert's token-blocks connects to *all* of that expert's weight column-blocks — so
+all six block-sparse arrays (`column_indices`, `row_indices`, `offsets`,
+`column_indices_t`, `offsets_t`, `block_offsets_t`) have a closed form. One CUDA
+kernel (one block per expert, no cross-block races) emits all six in a single
+launch, replacing `indices_variable` + `stk.ops.row_indices` + the
+`repeat_interleave`/`cumsum` glue + the sort-based transpose.
 
-### 4. Deduplicate the `bins` cumsum (`gpt_model.py::forward`)
-`_gather_tokens` and `_scatter_tokens` each recomputed
-`inclusive_cumsum(tokens_per_expert)`. Compute it once and share it.
+Isolated topology build **0.95 ms → 0.33 ms (2.9×)**; verified bit-identical to
+the corrected sort-based path across four configs (variable / uniform / top_k=1 /
+512-wide). Rebuild with `python setup.py build_ext --inplace` (or `pip install -e .`).
 
-### 5. Copy-kernel cleanup (`megablocks/backend/kernels.py`)
-Shared the autotune config list across the copy kernels and skip the
-`bf16→fp32→bf16` round-trip on the non-scaling (pure-copy) path — bit-identical,
-fewer instructions. **Net-neutral on measured time** here: these kernels are
-memory-bandwidth-bound at hidden=768, so the copy body isn't the bottleneck (the
-profiler shows `_padded_copy` unchanged at ~47 ms). Kept because it's clean and
-the wider autotune space (keyed on `NUM_COLUMNS`) can help other hidden sizes.
+### d. `padded_gather`: zero only the padding
+The padded gather output was `torch.zeros` (~113 MB/call), but the copy overwrites
+~94% of it. Now `torch.empty` + a `_zero_padding` kernel that zeros only the
+per-expert padding gaps. Padding *must* be zero (the backward weight-grad sums over
+padded rows, relying on `padding × grad == 0`). Gather 0.56 → 0.46 ms.
 
-## What was deliberately *not* done
+### e. Copy-kernel cleanup
+Shared autotune list + skip the fp32 round-trip on pure copies. Net-neutral
+(these kernels are bandwidth-bound) but bit-identical; kept for clarity.
 
-- **Fusing the scatter's top-k reduction** (`padded_scatter` writes a
-  `(tokens, top_k, hidden)` buffer then `.sum(dim=1)`; the sum is ~36% of scatter
-  time). An atomic-accumulate fusion would save ~0.28 ms/step but makes training
-  **non-deterministic** (bf16 atomics reorder). A deterministic fusion
-  (grid-over-tokens + inverse permutation) is a sizeable new indexing kernel that
-  also changes the numerics (no longer bit-identical) for ~4%. Not worth the risk
-  here; noted as future work.
-- **Removing the remaining `padded_gather` output-size sync.** It's genuinely
-  redundant (the value is already on the host), but eliminating it means threading
-  an `output_rows` argument through the shared `megablocks/ops` autograd
-  functions (also used by the non-variable dMoE path). Poor risk/reward for ~0.1 ms.
-- **The block-sparse GEMMs** (`stk` `sdd`/`dsd`/`dds`) dominate remaining CUDA
-  time but are an external library.
+## Results
 
-## Biggest remaining opportunity
+| stage (fwd, isolated) | original | final |
+|---|---|---|
+| topology | 1.36 ms | 0.48 ms |
+| gather | 0.47 ms | 0.42 ms |
+| everything else | ~same | ~same |
+| **full step (pipelined)** | **10.4 ms** | **6.85 ms** |
 
-Topology construction is still the largest forward stage (~0.83 ms) and is mostly
-Python glue + ~20 tiny launches (`row_indices`, a sparse transpose that re-sorts /
-re-histograms, several `int32` casts). Folding the whole topology build —
-column indices, row indices, offsets, and the transpose — into the existing
-`nanomoe_ops` CUDA kernel would remove most of it. Larger effort; left as future
-work.
+The pipelined-vs-serialized gap inverted from pathological (wall > serial) to
+healthy (wall < serial): the model is no longer launch-bound.
+
+Remaining CUDA time is dominated by the block-sparse GEMMs (`stk` `sdd`/`dsd`/
+`dds`), which are an external library.
 
 ## Verifying
 
-`profile_moe.py --variable-only` for timing. Correctness was checked by capturing
-the full fwd+bwd (output, aux losses, w1/w2/x/router grads) from the pristine code
-and diffing against the optimized version for the four configs above — all 0.0.
-(`tests/` can't run out of the box: `conftest.py` imports `composer`, which isn't
-installed.)
+Timing: `profile_moe.py --variable-only`. Correctness: a dense fp32 expert-loop
+reference (see the bug table) — **not** the old pristine baseline, which is buggy.
+Full fwd+bwd (output, aux losses, all grads) is bit-identical to the corrected
+sort-based path. (`tests/` can't run out of the box: `conftest.py` imports
+`composer`, which isn't installed.)

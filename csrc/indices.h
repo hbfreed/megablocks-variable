@@ -80,6 +80,146 @@ cudaError_t ConstructIndices(short * __restrict__ indices,
 
 }  // namespace construct_indices
 
+namespace construct_topology {
+
+// One block per expert. Each expert owns a contiguous slice of every output
+// array, so there are no cross-block races and no sort is needed: the variable
+// MoE topology is block-diagonal-dense (every one of an expert's token-blocks
+// connects to all of that expert's weight column-blocks).
+//
+// Per expert e (0-indexed), with:
+//   tb[e] = token-blocks, sb[e] = weight column-blocks,
+//   cbo[e] = first column-block, R[e] = first row-block,
+//   oo[e] = first non-zero-block (== output offset),
+// the forward CSR is laid out (t outer, k inner) and the transpose CSC is laid
+// out (k outer, t inner) -- see the closed-form derivation in gpt_model.py.
+const int kTopoThreads = 256;
+
+__global__ void __launch_bounds__(kTopoThreads)
+  BuildTopologyKernel(const int * __restrict__ tb,
+                      const int * __restrict__ sb,
+                      const int * __restrict__ cbo,
+                      const int * __restrict__ R,
+                      const int * __restrict__ oo,
+                      int block_rows,
+                      int total_col,
+                      int total_nnz,
+                      int * __restrict__ column_indices,
+                      int * __restrict__ row_indices,
+                      int * __restrict__ offsets,
+                      int * __restrict__ column_indices_t,
+                      int * __restrict__ offsets_t,
+                      int * __restrict__ block_offsets_t) {
+  int e = blockIdx.x;
+  int tbe = __ldg(tb + e);
+  int sbe = __ldg(sb + e);
+  int cboe = __ldg(cbo + e);
+  int Re = __ldg(R + e);
+  int ooe = __ldg(oo + e);
+  int eo = tbe * sbe;
+
+  // Forward CSR block indices: i = t * sbe + k.
+  for (int i = threadIdx.x; i < eo; i += blockDim.x) {
+    int t = i / sbe;
+    int k = i - t * sbe;
+    column_indices[ooe + i] = cboe + k;
+    row_indices[ooe + i] = Re + t;
+  }
+
+  // Transpose CSC block indices: j = k * tbe + t.
+  for (int j = threadIdx.x; j < eo; j += blockDim.x) {
+    int k = j / tbe;
+    int t = j - k * tbe;
+    column_indices_t[ooe + j] = Re + t;
+    block_offsets_t[ooe + j] = ooe + t * sbe + k;
+  }
+
+  // CSR row pointers for this expert's row-blocks.
+  for (int t = threadIdx.x; t < tbe; t += blockDim.x) {
+    offsets[Re + t] = ooe + t * sbe;
+  }
+
+  // CSC column pointers for this expert's column-blocks.
+  for (int k = threadIdx.x; k < sbe; k += blockDim.x) {
+    offsets_t[cboe + k] = ooe + k * tbe;
+  }
+
+  // The last expert closes both pointer arrays with the sentinel value.
+  if (e == gridDim.x - 1 && threadIdx.x == 0) {
+    offsets[block_rows] = total_nnz;
+    offsets_t[total_col] = total_nnz;
+  }
+}
+
+cudaError_t BuildTopology(const int * tb,
+                          const int * sb,
+                          const int * cbo,
+                          const int * R,
+                          const int * oo,
+                          int num_experts,
+                          int block_rows,
+                          int total_col,
+                          int total_nnz,
+                          int * column_indices,
+                          int * row_indices,
+                          int * offsets,
+                          int * column_indices_t,
+                          int * offsets_t,
+                          int * block_offsets_t,
+                          cudaStream_t stream) {
+  BuildTopologyKernel<<<num_experts, kTopoThreads, 0, stream>>>(
+      tb, sb, cbo, R, oo, block_rows, total_col, total_nnz,
+      column_indices, row_indices, offsets,
+      column_indices_t, offsets_t, block_offsets_t);
+  return cudaGetLastError();
+}
+
+}  // namespace construct_topology
+
+// Builds all six block-sparse topology arrays in a single kernel launch,
+// replacing the CUDA indices + stk.row_indices + sort-based transpose path.
+void build_topology(torch::Tensor tb,
+                    torch::Tensor sb,
+                    torch::Tensor cbo,
+                    torch::Tensor row_offsets,
+                    torch::Tensor nnz_offsets,
+                    int block_rows,
+                    int total_col,
+                    int total_nnz,
+                    torch::Tensor column_indices,
+                    torch::Tensor row_indices,
+                    torch::Tensor offsets,
+                    torch::Tensor column_indices_t,
+                    torch::Tensor offsets_t,
+                    torch::Tensor block_offsets_t) {
+  for (auto t : {tb, sb, cbo, row_offsets, nnz_offsets, column_indices,
+                 row_indices, offsets, column_indices_t, offsets_t,
+                 block_offsets_t}) {
+    TORCH_CHECK(t.is_cuda());
+    TORCH_CHECK(t.scalar_type() == torch::kInt);
+    TORCH_CHECK(t.is_contiguous());
+  }
+  int num_experts = tb.numel();
+  if (num_experts == 0 || total_nnz == 0) return;
+
+  CUDA_CALL(construct_topology::BuildTopology(tb.data_ptr<int>(),
+                                          sb.data_ptr<int>(),
+                                          cbo.data_ptr<int>(),
+                                          row_offsets.data_ptr<int>(),
+                                          nnz_offsets.data_ptr<int>(),
+                                          num_experts,
+                                          block_rows,
+                                          total_col,
+                                          total_nnz,
+                                          column_indices.data_ptr<int>(),
+                                          row_indices.data_ptr<int>(),
+                                          offsets.data_ptr<int>(),
+                                          column_indices_t.data_ptr<int>(),
+                                          offsets_t.data_ptr<int>(),
+                                          block_offsets_t.data_ptr<int>(),
+                                          c10::cuda::getCurrentCUDAStream()));
+}
+
 void indices(torch::Tensor padded_bins,
 	     torch::Tensor expert_block_counts,
 	     torch::Tensor expert_block_offsets,

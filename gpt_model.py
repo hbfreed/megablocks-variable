@@ -13,7 +13,6 @@ Notable features:
 
 import math
 from dataclasses import dataclass, field
-from typing import Any
 
 import stk
 import stk.ops
@@ -29,75 +28,6 @@ try:
     import nanomoe_ops
 except ModuleNotFoundError:
     nanomoe_ops = None
-
-
-class TopologyVarOp(torch.autograd.Function):
-    """Topology construction for variable-size experts."""
-
-    @staticmethod
-    def forward(
-        ctx: Any,
-        padded_bins: torch.Tensor,
-        expert_block_counts: torch.Tensor,
-        expert_block_offsets: torch.Tensor,
-        block_size: int,
-        output_block_rows: int,
-        total_nnz: int = -1,
-    ):
-        prepend = padded_bins.new_zeros(1)
-        bin_sizes = torch.diff(padded_bins, prepend=prepend)
-        expert_token_blocks = (bin_sizes // block_size).to(torch.int32)
-
-        expert_output_sizes = expert_token_blocks * expert_block_counts.to(torch.int32)
-        # The caller can supply total_nnz (computed host-side) to avoid a device
-        # sync here; fall back to the on-device reduction when it isn't provided.
-        if total_nnz < 0:
-            total_nnz = expert_output_sizes.sum().item()
-
-        if total_nnz == 0:
-            return torch.empty(0, dtype=torch.int16, device=padded_bins.device)
-
-        cumsum = expert_output_sizes.cumsum(0)
-        output_offsets_tensor = torch.cat([
-            torch.zeros(1, dtype=torch.int32, device=padded_bins.device),
-            cumsum[:-1]
-        ]).to(torch.int32)
-
-        out = torch.empty(total_nnz, dtype=torch.int16, device=padded_bins.device)
-
-        if nanomoe_ops is not None:
-            nanomoe_ops.indices_variable(
-                padded_bins,
-                expert_block_counts,
-                expert_block_offsets,
-                output_offsets_tensor,
-                block_size,
-                output_block_rows,
-                out,
-            )
-        else:
-            raise RuntimeError("nanomoe_ops not available. Build the extension first.")
-
-        return out
-
-
-def topology_var(
-    padded_bins: torch.Tensor,
-    expert_block_counts: torch.Tensor,
-    expert_block_offsets: torch.Tensor,
-    block_size: int,
-    output_block_rows: int,
-    total_nnz: int = -1,
-) -> torch.Tensor:
-    """Construct variable-size expert topology."""
-    return TopologyVarOp.apply(
-        padded_bins,
-        expert_block_counts,
-        expert_block_offsets,
-        block_size,
-        output_block_rows,
-        total_nnz,
-    )
 
 
 @dataclass
@@ -253,16 +183,6 @@ class MoEMLP(nn.Module):
         nn.init.trunc_normal_(self.w2, mean=0.0, std=0.02, a=-0.06, b=0.06)
 
         self.sort_end_bit = max(int(math.ceil(math.log2(self.num_experts))), 1)
-        # The transpose sort orders column-block indices, whose range is the
-        # number of column-blocks (total_expert_width / block_size), NOT
-        # num_experts. Sizing this to num_experts (as the original code did)
-        # silently drops high bits whenever an expert is wider than one block,
-        # corrupting the sparse transpose and therefore the expert weight
-        # gradients. This matches upstream megablocks dmoe.py.
-        max_column_index = self.total_expert_width // self.block_size
-        self.transpose_sort_end_bit = max(
-            int(math.ceil(math.log2(max_column_index))), 1
-        )
 
         self._size_blocks_host = [s // self.block_size for s in self.expert_widths]
         self.register_buffer(
@@ -366,15 +286,12 @@ class MoEMLP(nn.Module):
 
         # Single host sync for the whole topology build: pull the padded bins to
         # the host once and derive every python-int size from them (last bin,
-        # row-block count, and the total non-zero block count). This lets us pass
-        # ints (not 0-d tensors) into the ops below and, crucially, lets us hand
-        # total_nnz to topology_var so it need not do its own .item() sync.
+        # row-block count, total non-zero block count) to size the output buffers
+        # for the fused topology kernel below.
         padded_bins_host = padded_bins.tolist()
         last_padded = padded_bins_host[-1]
         padded_tokens = max(last_padded, self.block_size)
-        block_rows = padded_tokens // self.block_size
-        # Number of real row-blocks == sum(expert_token_blocks); equals block_rows
-        # except in the degenerate empty case (last_padded == 0) that clamp guards.
+        # Number of real row-blocks == sum(expert_token_blocks).
         num_row_blocks = last_padded // self.block_size
 
         # total_nnz = sum_e (padded_token_blocks_e * size_blocks_e), computed on
@@ -386,51 +303,56 @@ class MoEMLP(nn.Module):
             total_nnz += ((cur - prev) // self.block_size) * size_blocks
             prev = cur
 
-        column_indices = topology_var(
-            padded_bins,
-            self.expert_size_blocks,
-            self.expert_block_offsets,
-            self.block_size,
-            block_rows,
-            total_nnz,
-        )
-
+        # Per-expert quantities driving the closed-form topology: token-blocks
+        # (tb), first row-block (R = exclusive cumsum of tb), and first non-zero
+        # block (oo = exclusive cumsum of tb*size_blocks). size_blocks and the
+        # column-block offsets (cbo) are constant.
         prepend = padded_bins.new_zeros(1)
-        bin_sizes = torch.diff(padded_bins, prepend=prepend)
-        expert_token_blocks = bin_sizes // self.block_size
+        tb = (torch.diff(padded_bins, prepend=prepend) // self.block_size).to(torch.int32)
+        eo = tb * self.expert_size_blocks
+        R = torch.cat([tb.new_zeros(1), tb.cumsum(0)[:-1]]).to(torch.int32)
+        oo = torch.cat([eo.new_zeros(1), eo.cumsum(0)[:-1]]).to(torch.int32)
+        cbo = self.expert_block_offsets[: self.num_experts].contiguous()
 
-        # Passing output_size makes repeat_interleave sync-free (otherwise it
-        # syncs to discover the output length before allocating).
-        repeated_sizes = torch.repeat_interleave(
-            self.expert_size_blocks, expert_token_blocks, output_size=num_row_blocks
+        total_col_blocks = self.total_expert_width // self.block_size
+        dev = x.device
+
+        # All six block-sparse topology arrays are built in one CUDA launch (no
+        # sort, no stk.row_indices, no per-op glue) because the variable-MoE
+        # topology is block-diagonal-dense per expert. offsets/offsets_t are
+        # zero-init so the (empty) degenerate case is correct without the kernel.
+        column_indices = torch.empty(total_nnz, dtype=torch.int32, device=dev)
+        row_indices = torch.empty(total_nnz, dtype=torch.int32, device=dev)
+        offsets = torch.zeros(num_row_blocks + 1, dtype=torch.int32, device=dev)
+        column_indices_t = torch.empty(total_nnz, dtype=torch.int32, device=dev)
+        offsets_t = torch.zeros(total_col_blocks + 1, dtype=torch.int32, device=dev)
+        block_offsets_t = torch.empty(total_nnz, dtype=torch.int32, device=dev)
+
+        nanomoe_ops.build_topology(
+            tb,
+            self.expert_size_blocks,
+            cbo,
+            R,
+            oo,
+            num_row_blocks,
+            total_col_blocks,
+            total_nnz,
+            column_indices,
+            row_indices,
+            offsets,
+            column_indices_t,
+            offsets_t,
+            block_offsets_t,
         )
-        offsets = torch.cat([repeated_sizes.new_zeros(1), repeated_sizes.cumsum(0)])
-
-        column_indices = column_indices.to(torch.int32)
-        offsets = offsets.to(torch.int32)
 
         shape = (padded_tokens, self.total_expert_width)
-
-        num_blocks = column_indices.numel()
         data_placeholder = torch.empty(
-            num_blocks,
+            total_nnz,
             self.block_size,
             self.block_size,
             dtype=x.dtype,
             device="meta",
         )
-
-        row_indices = stk.ops.row_indices(
-            shape, data_placeholder, offsets, column_indices
-        )
-        row_indices = row_indices.to(torch.int32)
-
-        column_indices_t, offsets_t, block_offsets_t = self._sparse_transpose(
-            shape, row_indices, column_indices
-        )
-        column_indices_t = column_indices_t.to(torch.int32)
-        offsets_t = offsets_t.to(torch.int32)
-        block_offsets_t = block_offsets_t.to(torch.int32)
 
         topology = stk.Matrix(
             shape,
@@ -444,25 +366,6 @@ class MoEMLP(nn.Module):
         )
 
         return padded_bins, topology
-
-    def _sparse_transpose(self, size, row_indices, column_indices):
-        block_columns = self.total_expert_width // self.block_size
-
-        _, gather_indices = ops.sort(
-            column_indices.int(),
-            self.transpose_sort_end_bit,
-        )
-
-        column_indices_t = row_indices.gather(0, gather_indices.long())
-        block_offsets_t = gather_indices.int()
-
-        zero = torch.zeros((1,), dtype=torch.int32, device=row_indices.device)
-        nnz_per_column = ops.histogram(column_indices, block_columns)
-        nnz_per_column = ops.inclusive_cumsum(nnz_per_column, 0)
-        if nnz_per_column.dim() == 0:
-            nnz_per_column = nnz_per_column.unsqueeze(0)
-        offsets_t = torch.cat([zero, nnz_per_column])
-        return column_indices_t, offsets_t, block_offsets_t
 
     def _gather_tokens(self, x, indices, bin_ids, bins, padded_bins):
         return ops.padded_gather(
