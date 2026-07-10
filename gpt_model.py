@@ -253,8 +253,15 @@ class MoEMLP(nn.Module):
         nn.init.trunc_normal_(self.w2, mean=0.0, std=0.02, a=-0.06, b=0.06)
 
         self.sort_end_bit = max(int(math.ceil(math.log2(self.num_experts))), 1)
+        # The transpose sort orders column-block indices, whose range is the
+        # number of column-blocks (total_expert_width / block_size), NOT
+        # num_experts. Sizing this to num_experts (as the original code did)
+        # silently drops high bits whenever an expert is wider than one block,
+        # corrupting the sparse transpose and therefore the expert weight
+        # gradients. This matches upstream megablocks dmoe.py.
+        max_column_index = self.total_expert_width // self.block_size
         self.transpose_sort_end_bit = max(
-            int(math.ceil(math.log2(self.num_experts))), 1
+            int(math.ceil(math.log2(max_column_index))), 1
         )
 
         self._size_blocks_host = [s // self.block_size for s in self.expert_widths]
