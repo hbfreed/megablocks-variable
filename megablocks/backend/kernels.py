@@ -25,6 +25,57 @@ def assert_equal(a, b):
         raise ValueError(f'Expected dimensions to be equal but got {a} and {b}.',)
 
 
+# Autotune search space shared by the copy kernels. These kernels are purely
+# memory-bound (one row copied/reduced per program), so the goal is to move each
+# row in as few vectorized iterations as possible while keeping enough warps to
+# hide memory latency.
+_COPY_CONFIGS = [
+    triton.Config({'BLOCK_X': 64}, num_warps=2),
+    triton.Config({'BLOCK_X': 128}, num_warps=2),
+    triton.Config({'BLOCK_X': 256}, num_warps=2),
+    triton.Config({'BLOCK_X': 128}, num_warps=4),
+    triton.Config({'BLOCK_X': 256}, num_warps=4),
+    triton.Config({'BLOCK_X': 512}, num_warps=4),
+    triton.Config({'BLOCK_X': 1024}, num_warps=8),
+]
+
+
+# a: (padded_rows, hidden), the destination of padded_gather.
+# bins:        (num_experts,) inclusive cumsum of *real* tokens per expert.
+# padded_bins: (num_experts,) inclusive cumsum of *padded* tokens per expert.
+#
+# For each expert the copy writes its real tokens into the first rows of that
+# expert's padded region; the trailing rows (up to the padded bin boundary) are
+# padding that must be zero. Rather than zero the whole output and immediately
+# overwrite ~94% of it, we zero only these per-expert padding gaps.
+@triton.jit
+def _zero_padding(
+    out,
+    bins,
+    padded_bins,
+    NUM_COLUMNS: tl.constexpr,
+    BLOCK_X: tl.constexpr,
+):
+    expert = tl.program_id(0)
+
+    # Real-token and padded row bounds for this expert.
+    prev_real = tl.load(bins + expert - 1, mask=expert > 0, other=0)
+    real_end = tl.load(bins + expert)
+    prev_pad = tl.load(padded_bins + expert - 1, mask=expert > 0, other=0)
+    pad_end = tl.load(padded_bins + expert)
+
+    # The real tokens occupy [prev_pad, prev_pad + num_real); zero the rest.
+    num_real = real_end - prev_real
+    start = (prev_pad + num_real) * NUM_COLUMNS
+    end = pad_end * NUM_COLUMNS
+
+    col = tl.arange(0, BLOCK_X)
+    zeros = tl.zeros((BLOCK_X,), dtype=out.dtype.element_ty)
+    for base in range(start, end, BLOCK_X):
+        offsets = base + col
+        tl.store(out + offsets, zeros, mask=offsets < end)
+
+
 # a: (tokens, hidden_size), real.
 # indices: (tokens * top_k), integer.
 # bin_ids: (tokens * top_k), integer.
@@ -32,13 +83,7 @@ def assert_equal(a, b):
 # bins: (num_experts), integer.
 # padded_bins: (num_experts), integer.
 @triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_X': 64}, num_warps=2),
-        triton.Config({'BLOCK_X': 128}, num_warps=2),
-        triton.Config({'BLOCK_X': 256}, num_warps=2),
-        triton.Config({'BLOCK_X': 128}, num_warps=4),
-        triton.Config({'BLOCK_X': 256}, num_warps=4),
-    ],
+    configs=_COPY_CONFIGS,
     key=['NUM_COLUMNS'],
 )
 @triton.jit
@@ -87,7 +132,7 @@ def _padded_copy(
     offsets = tl.max_contiguous(tl.arange(0, BLOCK_X), BLOCK_X)
 
     # Load the scale, if requested.
-    scale = tl.load(weights + index_a) if SCALE else 1
+    scale = tl.load(weights + index_a).to(tl.float32) if SCALE else 1
 
     # Swap the pointers depending on the direction.
     iptr = a if A_TO_B else b
@@ -97,9 +142,14 @@ def _padded_copy(
     for _ in range(iterations):
         mask = offsets < NUM_COLUMNS
         x = tl.load(iptr + offsets, mask=mask)
-        x = x.to(tl.float32) * scale.to(tl.float32)
 
-        tl.store(optr + offsets, x.to(optr.dtype.element_ty), mask=mask)
+        # When not scaling this is a pure copy: skipping the fp32 round-trip is
+        # bit-identical (bf16 -> fp32 -> bf16 is the identity) and avoids the
+        # conversion instructions on this memory-bound path.
+        if SCALE:
+            x = (x.to(tl.float32) * scale).to(optr.dtype.element_ty)
+
+        tl.store(optr + offsets, x, mask=mask)
 
         offsets += BLOCK_X
 
@@ -121,7 +171,18 @@ def padded_gather(x, indices, bin_ids, weights, bins, padded_bins, top_k):
     # NOTE: Because of the padding, the output size is dynamic.
     # We load the final padded bin bound to get the output rows.
     output_rows = padded_bins[-1].cpu().item()
-    out = torch.zeros((output_rows, x.shape[1]), dtype=x.dtype, device=x.device)
+    out = torch.empty((output_rows, x.shape[1]), dtype=x.dtype, device=x.device)
+
+    # The copy below writes every real token row, so we only need to zero the
+    # per-expert padding gaps rather than the whole (much larger) output.
+    _zero_padding[(bins.shape[0],)](
+        out,
+        bins,
+        padded_bins,
+        NUM_COLUMNS=x.shape[1],
+        BLOCK_X=1024,
+        num_warps=4,
+    )
     _padded_copy[(indices.shape[0],)](
         x,
         out,
@@ -215,13 +276,7 @@ def scatter(x, indices, bin_ids, weights, bins, top_k):
 # bins: (num_experts), integer.
 # padded_bins: (num_experts), integer.
 @triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_X': 64}, num_warps=2),
-        triton.Config({'BLOCK_X': 128}, num_warps=2),
-        triton.Config({'BLOCK_X': 256}, num_warps=2),
-        triton.Config({'BLOCK_X': 128}, num_warps=4),
-        triton.Config({'BLOCK_X': 256}, num_warps=4),
-    ],
+    configs=_COPY_CONFIGS,
     key=['NUM_COLUMNS'],
 )
 @triton.jit
@@ -313,13 +368,7 @@ def scatter_wgrad(x, grad, indices, bin_ids, bins, top_k):
 # weights: (tokens * top_k), real.
 # bins: (num_experts), integer.
 @triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_X': 64}, num_warps=2),
-        triton.Config({'BLOCK_X': 128}, num_warps=2),
-        triton.Config({'BLOCK_X': 256}, num_warps=2),
-        triton.Config({'BLOCK_X': 128}, num_warps=4),
-        triton.Config({'BLOCK_X': 256}, num_warps=4),
-    ],
+    configs=_COPY_CONFIGS,
     key=['NUM_COLUMNS'],
 )
 @triton.jit
@@ -370,7 +419,7 @@ def _binned_copy(
     offsets = tl.max_contiguous(tl.arange(0, BLOCK_X), BLOCK_X)
 
     # Load the scale, if requested.
-    scale = tl.load(weights + index_a) if SCALE else 1
+    scale = tl.load(weights + index_a).to(tl.float32) if SCALE else 1
 
     # Swap the pointers depending on the direction.
     #
@@ -382,9 +431,12 @@ def _binned_copy(
     for _ in range(iterations):
         mask = offsets < NUM_COLUMNS
         x = tl.load(iptr + offsets, mask=mask)
-        x = x.to(tl.float32) * scale.to(tl.float32)
 
-        tl.store(optr + offsets, x.to(optr.dtype.element_ty), mask=mask)
+        # See _padded_copy: skip the fp32 round-trip on the pure-copy path.
+        if SCALE:
+            x = (x.to(tl.float32) * scale).to(optr.dtype.element_ty)
+
+        tl.store(optr + offsets, x, mask=mask)
 
         offsets += BLOCK_X
 
@@ -455,13 +507,7 @@ def binned_scatter(x, indices, weights, bins, top_k):
 # weights: (tokens * top_k), real.
 # bins: (num_experts), integer.
 @triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_X': 64}, num_warps=2),
-        triton.Config({'BLOCK_X': 128}, num_warps=2),
-        triton.Config({'BLOCK_X': 256}, num_warps=2),
-        triton.Config({'BLOCK_X': 128}, num_warps=4),
-        triton.Config({'BLOCK_X': 256}, num_warps=4),
-    ],
+    configs=_COPY_CONFIGS,
     key=['NUM_COLUMNS'],
 )
 @triton.jit

@@ -42,13 +42,17 @@ class TopologyVarOp(torch.autograd.Function):
         expert_block_offsets: torch.Tensor,
         block_size: int,
         output_block_rows: int,
+        total_nnz: int = -1,
     ):
         prepend = padded_bins.new_zeros(1)
         bin_sizes = torch.diff(padded_bins, prepend=prepend)
         expert_token_blocks = (bin_sizes // block_size).to(torch.int32)
 
         expert_output_sizes = expert_token_blocks * expert_block_counts.to(torch.int32)
-        total_nnz = expert_output_sizes.sum().item()
+        # The caller can supply total_nnz (computed host-side) to avoid a device
+        # sync here; fall back to the on-device reduction when it isn't provided.
+        if total_nnz < 0:
+            total_nnz = expert_output_sizes.sum().item()
 
         if total_nnz == 0:
             return torch.empty(0, dtype=torch.int16, device=padded_bins.device)
@@ -83,6 +87,7 @@ def topology_var(
     expert_block_offsets: torch.Tensor,
     block_size: int,
     output_block_rows: int,
+    total_nnz: int = -1,
 ) -> torch.Tensor:
     """Construct variable-size expert topology."""
     return TopologyVarOp.apply(
@@ -91,6 +96,7 @@ def topology_var(
         expert_block_offsets,
         block_size,
         output_block_rows,
+        total_nnz,
     )
 
 
@@ -251,11 +257,10 @@ class MoEMLP(nn.Module):
             int(math.ceil(math.log2(self.num_experts))), 1
         )
 
+        self._size_blocks_host = [s // self.block_size for s in self.expert_widths]
         self.register_buffer(
             "expert_size_blocks",
-            torch.tensor(
-                [s // self.block_size for s in self.expert_widths], dtype=torch.int32
-            ),
+            torch.tensor(self._size_blocks_host, dtype=torch.int32),
             persistent=False,
         )
         self.register_buffer(
@@ -293,9 +298,10 @@ class MoEMLP(nn.Module):
             selected_experts_flat
         )
         padded_bins, topology = self._create_topology(x_flat, tokens_per_expert)
-        x_permuted = self._gather_tokens(
-            x_flat, indices, bin_ids, tokens_per_expert, padded_bins
-        )
+        # Real (unpadded) token bins are shared by the gather and scatter; compute
+        # the cumsum once instead of once per call.
+        bins = ops.inclusive_cumsum(tokens_per_expert, 0).contiguous()
+        x_permuted = self._gather_tokens(x_flat, indices, bin_ids, bins, padded_bins)
         x_permuted = stk.ops.sdd(x_permuted, self.w1, topology)
         x_permuted = relu_squared(x_permuted)
         x_permuted = stk.ops.dsd(x_permuted, self.w2)
@@ -304,7 +310,7 @@ class MoEMLP(nn.Module):
             indices,
             bin_ids,
             top_k_weights_flat,
-            tokens_per_expert,
+            bins,
             padded_bins,
         )
         output = rearrange(
@@ -351,8 +357,27 @@ class MoEMLP(nn.Module):
         padded_bins = ops.inclusive_cumsum(padded_tokens_per_expert, 0)
         padded_bins = padded_bins.contiguous()
 
-        padded_tokens = padded_bins[-1].clamp_min(self.block_size)
+        # Single host sync for the whole topology build: pull the padded bins to
+        # the host once and derive every python-int size from them (last bin,
+        # row-block count, and the total non-zero block count). This lets us pass
+        # ints (not 0-d tensors) into the ops below and, crucially, lets us hand
+        # total_nnz to topology_var so it need not do its own .item() sync.
+        padded_bins_host = padded_bins.tolist()
+        last_padded = padded_bins_host[-1]
+        padded_tokens = max(last_padded, self.block_size)
         block_rows = padded_tokens // self.block_size
+        # Number of real row-blocks == sum(expert_token_blocks); equals block_rows
+        # except in the degenerate empty case (last_padded == 0) that clamp guards.
+        num_row_blocks = last_padded // self.block_size
+
+        # total_nnz = sum_e (padded_token_blocks_e * size_blocks_e), computed on
+        # the host from the values we already transferred (integer-exact match to
+        # the device-side reduction it replaces).
+        total_nnz = 0
+        prev = 0
+        for cur, size_blocks in zip(padded_bins_host, self._size_blocks_host):
+            total_nnz += ((cur - prev) // self.block_size) * size_blocks
+            prev = cur
 
         column_indices = topology_var(
             padded_bins,
@@ -360,14 +385,17 @@ class MoEMLP(nn.Module):
             self.expert_block_offsets,
             self.block_size,
             block_rows,
+            total_nnz,
         )
 
         prepend = padded_bins.new_zeros(1)
         bin_sizes = torch.diff(padded_bins, prepend=prepend)
         expert_token_blocks = bin_sizes // self.block_size
 
+        # Passing output_size makes repeat_interleave sync-free (otherwise it
+        # syncs to discover the output length before allocating).
         repeated_sizes = torch.repeat_interleave(
-            self.expert_size_blocks, expert_token_blocks
+            self.expert_size_blocks, expert_token_blocks, output_size=num_row_blocks
         )
         offsets = torch.cat([repeated_sizes.new_zeros(1), repeated_sizes.cumsum(0)])
 
@@ -429,18 +457,12 @@ class MoEMLP(nn.Module):
         offsets_t = torch.cat([zero, nnz_per_column])
         return column_indices_t, offsets_t, block_offsets_t
 
-    def _gather_tokens(self, x, indices, bin_ids, tokens_per_expert, padded_bins):
-        bins = ops.inclusive_cumsum(tokens_per_expert, 0)
-        bins = bins.contiguous()
+    def _gather_tokens(self, x, indices, bin_ids, bins, padded_bins):
         return ops.padded_gather(
             x, indices, bin_ids, bins, padded_bins, self.num_active_experts
         )
 
-    def _scatter_tokens(
-        self, x, indices, bin_ids, weights, tokens_per_expert, padded_bins
-    ):
-        bins = ops.inclusive_cumsum(tokens_per_expert, 0)
-        bins = bins.contiguous()
+    def _scatter_tokens(self, x, indices, bin_ids, weights, bins, padded_bins):
         return ops.padded_scatter(
             x, indices, bin_ids, weights, bins, padded_bins, self.num_active_experts
         )
