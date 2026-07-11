@@ -5,8 +5,8 @@ Work on the variable-size `MoEMLP` (`gpt_model.py`) exercised by
 
 1. **Correctness:** fixed a latent bug that produced **wrong expert weight
    gradients** for any expert wider than 128 (i.e. every real config).
-2. **Speed:** **10.4 ms → 6.85 ms per fwd+bwd step (1.52×, −34%)**; ~790k →
-   ~1.20M tokens/s.
+2. **Speed:** **10.4 ms → 6.0 ms per fwd+bwd step (1.73×, −42%)**; ~790k →
+   ~1.37M tokens/s.
 
 Benchmark config: RTX 3090 (Ampere), bf16, batch 8 × seq 1024, hidden 768,
 64 experts, ffn 256/expert, top_k 8.
@@ -88,24 +88,41 @@ The padded gather output was `torch.zeros` (~113 MB/call), but the copy overwrit
 per-expert padding gaps. Padding *must* be zero (the backward weight-grad sums over
 padded rows, relying on `padding × grad == 0`). Gather 0.56 → 0.46 ms.
 
-### e. Copy-kernel cleanup
-Shared autotune list + skip the fp32 round-trip on pure copies. Net-neutral
-(these kernels are bandwidth-bound) but bit-identical; kept for clarity.
+### e. Fused scatter + top-k reduction (`_scatter_reduce`)
+`padded_scatter` wrote a `(tokens, top_k, hidden)` buffer (**96 MiB**) and then
+`.sum(dim=1)` over it — a whole extra write + read (~33% of scatter). Replaced with
+a kernel that, per output token, accumulates that token's top_k scattered rows
+directly in fp32 registers (using `inv = inverse(indices)` to locate each source
+row) and writes `(tokens, hidden)`. Only `top_k > 1` uses it. Scatter
+**0.44 → 0.245 ms (1.8×)**. The no-weights path is bit-identical; the weighted path
+differs only at bf16 epsilon and is slightly *more* accurate (fp32 accumulation).
+
+### f. Fused `relu_squared` activation
+`F.relu(x).square()` ran as separate eager kernels (+ their autograd) over the
+sparse block data. Wrapped in a custom autograd Function with single fused (jit)
+forward/backward kernels. Bit-identical; isolated fwd+bwd **0.67 → 0.41 ms (1.6×)**.
+
+### g. Copy-kernel cleanup + no-op removal
+Shared autotune list, skip the fp32 round-trip on pure copies (net-neutral,
+bandwidth-bound), and dropped an identity `rearrange` in the compute-loss term.
 
 ## Results
 
 | stage (fwd, isolated) | original | final |
 |---|---|---|
-| topology | 1.36 ms | 0.48 ms |
-| gather | 0.47 ms | 0.42 ms |
-| everything else | ~same | ~same |
-| **full step (pipelined)** | **10.4 ms** | **6.85 ms** |
+| topology | 1.36 ms | 0.49 ms |
+| scatter | 0.47 ms | 0.27 ms |
+| activation | 0.19 ms | 0.13 ms |
+| gather | 0.47 ms | 0.43 ms |
+| sdd / dsd (external GEMMs) | ~1.1 ms | ~1.1 ms |
+| **full step (pipelined)** | **10.4 ms** | **6.0 ms** |
 
 The pipelined-vs-serialized gap inverted from pathological (wall > serial) to
-healthy (wall < serial): the model is no longer launch-bound.
-
-Remaining CUDA time is dominated by the block-sparse GEMMs (`stk` `sdd`/`dsd`/
-`dds`), which are an external library.
+healthy (wall < serial): the model is no longer launch-bound. Remaining time is
+dominated by the block-sparse GEMMs (`stk` `sdd`/`dsd`/`dds`), which are external.
+The gather's residual cost is scattered reads (fundamental); further wins would
+need `torch.compile` of the routing/aux-loss glue, which `stk`'s custom autograd
+currently blocks.
 
 ## Verifying
 
