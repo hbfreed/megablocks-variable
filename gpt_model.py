@@ -255,15 +255,9 @@ class MoEMLP(nn.Module):
         load_balance_loss = self._compute_load_balance_loss(
             router_probs, selected_experts_flat, f_i
         )
-        router_probs_flat = rearrange(
-            router_probs,
-            "(batch_size seq_len) n_embd -> (batch_size seq_len) n_embd",
-            batch_size=batch_size,
-            seq_len=seq_len,
-        )
+        # router_probs is already (batch_size*seq_len, num_experts).
         compute_loss = (
-            router_probs_flat
-            @ self.expert_widths_normalized.to(router_probs_flat.dtype)
+            router_probs @ self.expert_widths_normalized.to(router_probs.dtype)
         ).mean()
 
         aux_loss = {
