@@ -252,13 +252,14 @@ class MoEMLP(nn.Module):
         # Reuse tokens_per_expert from histogram instead of expensive scatter_add_
         # f_i = fraction of tokens assigned to each expert
         f_i = (tokens_per_expert.float() / tokens_per_expert.sum()).to(x.dtype)
+        # p_i = mean routing probability per expert. Both aux losses use it, and
+        # (router_probs @ w).mean() == router_probs.mean(0) @ w, so reusing p_i
+        # avoids a full (tokens, num_experts) @ (num_experts,) matmul + reduction.
+        p_i = router_probs.mean(dim=0)
         load_balance_loss = self._compute_load_balance_loss(
-            router_probs, selected_experts_flat, f_i
+            p_i, selected_experts_flat, f_i
         )
-        # router_probs is already (batch_size*seq_len, num_experts).
-        compute_loss = (
-            router_probs @ self.expert_widths_normalized.to(router_probs.dtype)
-        ).mean()
+        compute_loss = p_i @ self.expert_widths_normalized.to(p_i.dtype)
 
         aux_loss = {
             "router_z_loss": router_z_loss,
@@ -371,8 +372,8 @@ class MoEMLP(nn.Module):
             x, indices, bin_ids, weights, bins, padded_bins, self.num_active_experts
         )
 
-    def _compute_load_balance_loss(self, router_probs, experts_flat, f_i):
-        p_i = router_probs.mean(dim=0).to(torch.float32)
+    def _compute_load_balance_loss(self, p_i, experts_flat, f_i):
+        p_i = p_i.to(torch.float32)
         f_i = f_i.to(torch.float32)
 
         if len(set(self.expert_widths)) == 1:
