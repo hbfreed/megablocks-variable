@@ -4,12 +4,13 @@
 import gc
 import logging
 import os
+import random
+from datetime import timedelta
 
-import composer
+import numpy as np
 import pytest
 import torch
-from composer.devices import DeviceCPU, DeviceGPU
-from composer.utils import dist, reproducibility
+import torch.distributed as dist
 
 
 @pytest.fixture(autouse=True)
@@ -38,7 +39,9 @@ def cleanup_dist():
     yield
     # Avoid race condition where a test is still writing to a file on one rank
     # while the file system is being torn down on another rank.
-    dist.barrier()
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 @pytest.fixture(autouse=True, scope='session')
@@ -47,19 +50,17 @@ def configure_dist(request: pytest.FixtureRequest):
     # so individual tests that do not use the trainer
     # do not need to worry about manually configuring dist.
 
-    if dist.get_world_size() == 1:
+    world_size = int(os.environ.get('WORLD_SIZE', '1'))
+    if world_size == 1:
         return
 
-    device = None
-
-    for item in request.session.items:
-        device = DeviceCPU() if item.get_closest_marker('gpu') is None else DeviceGPU()
-        break
-
-    assert device is not None
+    uses_gpu = any(item.get_closest_marker('gpu') is not None for item in request.session.items)
+    backend = 'nccl' if uses_gpu else 'gloo'
+    if uses_gpu:
+        torch.cuda.set_device(int(os.environ.get('LOCAL_RANK', '0')))
 
     if not dist.is_initialized():
-        dist.initialize_dist(device, timeout=300.0)
+        dist.init_process_group(backend=backend, timeout=timedelta(seconds=300))
     # Hold PyTest until all ranks have reached this barrier. Ensure that no rank starts
     # any test before other ranks are ready to start it, which could be a cause of random timeouts
     # (e.g. rank 1 starts the next test while rank 0 is finishing up the previous test).
@@ -70,38 +71,27 @@ def configure_dist(request: pytest.FixtureRequest):
 def set_log_levels():
     """Ensures all log levels are set to DEBUG."""
     logging.basicConfig()
-    logging.getLogger(composer.__name__).setLevel(logging.DEBUG)
 
 
 @pytest.fixture(autouse=True)
-def seed_all(rank_zero_seed: int, monkeypatch: pytest.MonkeyPatch):
-    """Monkeypatch reproducibility.
-
-    Make get_random_seed to always return the rank zero seed, and set the random seed before each test to the rank local
-    seed.
-    """
-    monkeypatch.setattr(
-        reproducibility,
-        'get_random_seed',
-        lambda: rank_zero_seed,
-    )
-    reproducibility.seed_all(rank_zero_seed + dist.get_global_rank())
+def seed_all(rank_zero_seed: int):
+    """Seed Python, NumPy, and PyTorch with a rank-local seed."""
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    seed = rank_zero_seed + rank
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
 
 @pytest.fixture(autouse=True)
 def remove_run_name_env_var():
     # Remove environment variables for run names in unit tests
-    composer_run_name = os.environ.get('COMPOSER_RUN_NAME')
     run_name = os.environ.get('RUN_NAME')
 
-    if 'COMPOSER_RUN_NAME' in os.environ:
-        del os.environ['COMPOSER_RUN_NAME']
     if 'RUN_NAME' in os.environ:
         del os.environ['RUN_NAME']
 
     yield
 
-    if composer_run_name is not None:
-        os.environ['COMPOSER_RUN_NAME'] = composer_run_name
     if run_name is not None:
         os.environ['RUN_NAME'] = run_name

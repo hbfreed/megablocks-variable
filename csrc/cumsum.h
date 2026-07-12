@@ -31,6 +31,15 @@ template <typename Type> struct Cumsum {
 		  int num_items,
 		  cudaStream_t stream = 0,
 		  bool debug_synchronous = false) {
+#if CUB_VERSION >= 300000  // CCCL 3.0 (CUDA 13) removed debug_synchronous
+    (void)debug_synchronous;
+    CUDA_CALL(cub::DeviceScan::ExclusiveSum(d_temp_storage,
+					    temp_storage_bytes,
+					    d_in,
+					    d_out,
+					    num_items,
+					    stream));
+#else
     CUDA_CALL(cub::DeviceScan::ExclusiveSum(d_temp_storage,
 					    temp_storage_bytes,
 					    d_in,
@@ -38,6 +47,7 @@ template <typename Type> struct Cumsum {
 					    num_items,
 					    stream,
 					    debug_synchronous));
+#endif
   }
 };
 
@@ -52,6 +62,15 @@ template <> struct Cumsum<Inclusive> {
 		  int num_items,
 		  cudaStream_t stream = 0,
 		  bool debug_synchronous = false) {
+#if CUB_VERSION >= 300000  // CCCL 3.0 (CUDA 13) removed debug_synchronous
+    (void)debug_synchronous;
+    CUDA_CALL(cub::DeviceScan::InclusiveSum(d_temp_storage,
+					    temp_storage_bytes,
+					    d_in,
+					    d_out,
+					    num_items,
+					    stream));
+#else
     CUDA_CALL(cub::DeviceScan::InclusiveSum(d_temp_storage,
 					    temp_storage_bytes,
 					    d_in,
@@ -59,6 +78,7 @@ template <> struct Cumsum<Inclusive> {
 					    num_items,
 					    stream,
 					    debug_synchronous));
+#endif
   }
 };
 

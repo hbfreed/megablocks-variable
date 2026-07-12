@@ -52,7 +52,6 @@ while True:
 
 classifiers = [
     'Programming Language :: Python :: 3',
-    'Programming Language :: Python :: 3.9',
     'Programming Language :: Python :: 3.10',
     'Programming Language :: Python :: 3.11',
     'License :: OSI Approved :: BSD License',
@@ -62,7 +61,7 @@ classifiers = [
 install_requires = [
     'numpy>=1.21.5,<2.1.0',
     'packaging>=21.3.0',
-    'torch>=2.7.0',
+    'torch>=2.12.0,<2.13',
     'stanford-stk==0.7.1',
 ]
 
@@ -82,7 +81,6 @@ extra_deps['dev'] = [
 ]
 
 extra_deps['testing'] = [
-    'mosaicml>=0.24.1',
 ]
 
 extra_deps['all'] = list({dep for key, deps in extra_deps.items() for dep in deps if key not in {'testing'}})
@@ -150,6 +148,6 @@ setup(
     cmdclass=cmdclass,
     install_requires=install_requires,
     extras_require=extra_deps,
-    python_requires='>=3.9',
+    python_requires='>=3.10',
     package_data={_PACKAGE_NAME: ['py.typed']},
 )

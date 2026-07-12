@@ -53,16 +53,6 @@ def construct_moes(
     mlp_impl: str = 'sparse',
     moe_zloss_weight: float = 0,
 ):
-    # All tests are skipped if triton >=3.2.0 is installed since sparse is not supported
-    # TODO: Remove this once sparse is supported with triton >=3.2.0
-    if mlp_impl == 'sparse':
-        try:
-            import triton
-            if triton.__version__ >= '3.2.0':
-                pytest.skip('Sparse MLP is not supported with triton >=3.2.0')
-        except ImportError:
-            pass
-
     init_method = partial(torch.nn.init.normal_, mean=0.0, std=0.1)
     args = Arguments(
         hidden_size=hidden_size,
@@ -238,4 +228,6 @@ def test_dmoe_forward_vs_moe(
     expected_out, _ = moe_mlp(x)
     out, _ = dmoe_mlp(x)
     assert out.shape == x.shape == expected_out.shape
-    assert torch.allclose(out, expected_out)
+    # Sparse and dense kernels accumulate in a different order. Allow one
+    # bfloat16 quantization step at the output scale.
+    torch.testing.assert_close(out, expected_out, rtol=1e-2, atol=2e-2)
