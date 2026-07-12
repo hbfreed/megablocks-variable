@@ -5,13 +5,14 @@ import os
 from typing import List, Optional
 
 import pytest
-from composer.utils import reproducibility
+import torch
 
 # Allowed options for pytest.mark.world_size()
 WORLD_SIZE_OPTIONS = (1, 2)
 
 # Enforce deterministic mode before any tests start.
-reproducibility.configure_deterministic_mode()
+os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+torch.use_deterministic_algorithms(True)
 
 # Add the path of any pytest fixture files you want to make global
 pytest_plugins = [
@@ -98,7 +99,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         parser,
         'seed',
         help="""\
-        Rank zero seed to use. `reproducibility.seed_all(seed + dist.get_global_rank())` will be invoked
+        Rank zero seed. Each process uses `seed + rank`.
         before each test.""",
     )
 

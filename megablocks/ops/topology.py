@@ -32,11 +32,27 @@ class TopologyOp(torch.autograd.Function):
             dtype=torch.int16,
             device=padded_bins.device,
         )
+        num_experts = padded_bins.numel()
+        expert_block_counts = torch.full(
+            (num_experts,),
+            output_block_columns,
+            dtype=torch.int32,
+            device=padded_bins.device,
+        )
+        expert_block_offsets = torch.arange(
+            num_experts,
+            dtype=torch.int32,
+            device=padded_bins.device,
+        ) * output_block_columns
+        expert_starts = torch.cat((padded_bins.new_zeros(1), padded_bins[:-1]))
+        output_offsets = expert_starts // block_size * output_block_columns
         ops.indices(
             padded_bins,
+            expert_block_counts,
+            expert_block_offsets,
+            output_offsets,
             block_size,
             output_block_rows,
-            output_block_columns,
             out,
         )
         return out

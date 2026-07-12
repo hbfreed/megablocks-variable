@@ -1,6 +1,6 @@
-FROM nvcr.io/nvidia/pytorch:23.09-py3
+FROM pytorch/pytorch:2.12.1-cuda12.6-cudnn9-devel
 
-RUN pip install stanford-stk==0.0.6
+RUN pip install stanford-stk==0.7.1
 
 RUN pip install flash-attn
 

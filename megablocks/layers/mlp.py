@@ -265,8 +265,8 @@ class MemoryOptimizedMLP(torch.autograd.Function):
             dactivation_fn_out.shape,
             dactivation_fn_out.data,
             dactivation_fn_out.offsets,
-            dactivation_fn_out.row_indices,
-            dactivation_fn_out.column_indices,
+            dactivation_fn_out.row_indices.to(torch.int32),
+            dactivation_fn_out.column_indices.to(torch.int32),
         )
 
         # Compute dsdd_out.
@@ -289,10 +289,10 @@ class MemoryOptimizedMLP(torch.autograd.Function):
             dsdd_out.shape,
             dsdd_out.data,
             dsdd_out.offsets,
-            dsdd_out.row_indices,
-            dsdd_out.column_indices,
+            dsdd_out.row_indices.to(torch.int32),
+            dsdd_out.column_indices.to(torch.int32),
             dsdd_out.offsets_t,
-            dsdd_out.column_indices_t,
+            dsdd_out.column_indices_t.to(torch.int32),
             dsdd_out.block_offsets_t,
             False,
             w1,
