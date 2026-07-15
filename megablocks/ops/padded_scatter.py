@@ -61,6 +61,7 @@ class PaddedScatterOp(torch.autograd.Function):
                 bins,
                 padded_bins,
                 ctx.top_k,
+                output_rows=ctx.x_shape[0],
             )
 
         wgrad = None

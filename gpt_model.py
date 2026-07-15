@@ -224,11 +224,15 @@ class MoEMLP(nn.Module):
         bin_ids, indices, tokens_per_expert = self._sort_tokens_by_expert(
             selected_experts_flat
         )
-        padded_bins, topology = self._create_topology(x_flat, tokens_per_expert)
+        padded_bins, topology, padded_tokens = self._create_topology(
+            x_flat, tokens_per_expert
+        )
         # Real (unpadded) token bins are shared by the gather and scatter; compute
         # the cumsum once instead of once per call.
         bins = ops.inclusive_cumsum(tokens_per_expert, 0).contiguous()
-        x_permuted = self._gather_tokens(x_flat, indices, bin_ids, bins, padded_bins)
+        x_permuted = self._gather_tokens(
+            x_flat, indices, bin_ids, bins, padded_bins, padded_tokens
+        )
         x_permuted = stk.ops.sdd(x_permuted, self.w1, topology)
         x_permuted = relu_squared(x_permuted)
         x_permuted = stk.ops.dsd(x_permuted, self.w2)
@@ -251,7 +255,9 @@ class MoEMLP(nn.Module):
 
         # Reuse tokens_per_expert from histogram instead of expensive scatter_add_
         # f_i = fraction of tokens assigned to each expert
-        f_i = (tokens_per_expert.float() / tokens_per_expert.sum()).to(x.dtype)
+        f_i = (
+            tokens_per_expert.float() / selected_experts_flat.numel()
+        ).to(x.dtype)
         # p_i = mean routing probability per expert. Both aux losses use it, and
         # (router_probs @ w).mean() == router_probs.mean(0) @ w, so reusing p_i
         # avoids a full (tokens, num_experts) @ (num_experts,) matmul + reduction.
@@ -270,6 +276,11 @@ class MoEMLP(nn.Module):
         return output, aux_loss, f_i
 
     def _sort_tokens_by_expert(self, selected_experts_flat):
+        # CUB's radix sort carries both keys and permutation values in the input
+        # dtype. Expert ids fit in int32; matching the default dMoE path halves
+        # routing metadata traffic compared with sorting torch.topk's int64
+        # output.
+        selected_experts_flat = selected_experts_flat.int()
         bin_ids, indices = ops.sort(selected_experts_flat, self.sort_end_bit)
         tokens_per_expert = ops.histogram(selected_experts_flat, self.num_experts)
         return bin_ids, indices, tokens_per_expert
@@ -298,15 +309,9 @@ class MoEMLP(nn.Module):
             total_nnz += ((cur - prev) // self.block_size) * size_blocks
             prev = cur
 
-        # Per-expert quantities driving the closed-form topology: token-blocks
-        # (tb), first row-block (R = exclusive cumsum of tb), and first non-zero
-        # block (oo = exclusive cumsum of tb*size_blocks). size_blocks and the
-        # column-block offsets (cbo) are constant.
-        prepend = padded_bins.new_zeros(1)
-        tb = (torch.diff(padded_bins, prepend=prepend) // self.block_size).to(torch.int32)
-        eo = tb * self.expert_size_blocks
-        R = torch.cat([tb.new_zeros(1), tb.cumsum(0)[:-1]]).to(torch.int32)
-        oo = torch.cat([eo.new_zeros(1), eo.cumsum(0)[:-1]]).to(torch.int32)
+        # Expert widths and column-block offsets are constant. Token-block,
+        # row, and nonzero offsets are derived from padded_bins directly in the
+        # fused topology kernel, avoiding a chain of tiny device operations.
         cbo = self.expert_block_offsets[: self.num_experts].contiguous()
 
         total_col_blocks = self.total_expert_width // self.block_size
@@ -314,21 +319,20 @@ class MoEMLP(nn.Module):
 
         # All six block-sparse topology arrays are built in one CUDA launch (no
         # sort, no stk.row_indices, no per-op glue) because the variable-MoE
-        # topology is block-diagonal-dense per expert. offsets/offsets_t are
-        # zero-init so the (empty) degenerate case is correct without the kernel.
+        # topology is block-diagonal-dense per expert. The kernel writes every
+        # metadata entry, including both pointer-array sentinels.
         column_indices = torch.empty(total_nnz, dtype=torch.int32, device=dev)
         row_indices = torch.empty(total_nnz, dtype=torch.int32, device=dev)
-        offsets = torch.zeros(num_row_blocks + 1, dtype=torch.int32, device=dev)
+        offsets = torch.empty(num_row_blocks + 1, dtype=torch.int32, device=dev)
         column_indices_t = torch.empty(total_nnz, dtype=torch.int32, device=dev)
-        offsets_t = torch.zeros(total_col_blocks + 1, dtype=torch.int32, device=dev)
+        offsets_t = torch.empty(total_col_blocks + 1, dtype=torch.int32, device=dev)
         block_offsets_t = torch.empty(total_nnz, dtype=torch.int32, device=dev)
 
         nanomoe_ops.build_topology(
-            tb,
+            padded_bins,
             self.expert_size_blocks,
             cbo,
-            R,
-            oo,
+            self.block_size,
             num_row_blocks,
             total_col_blocks,
             total_nnz,
@@ -360,11 +364,19 @@ class MoEMLP(nn.Module):
             block_offsets_t,
         )
 
-        return padded_bins, topology
+        return padded_bins, topology, last_padded
 
-    def _gather_tokens(self, x, indices, bin_ids, bins, padded_bins):
+    def _gather_tokens(
+        self, x, indices, bin_ids, bins, padded_bins, padded_tokens
+    ):
         return ops.padded_gather(
-            x, indices, bin_ids, bins, padded_bins, self.num_active_experts
+            x,
+            indices,
+            bin_ids,
+            bins,
+            padded_bins,
+            self.num_active_experts,
+            output_rows=padded_tokens,
         )
 
     def _scatter_tokens(self, x, indices, bin_ids, weights, bins, padded_bins):

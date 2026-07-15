@@ -7,9 +7,42 @@ Work on the variable-size `MoEMLP` (`gpt_model.py`) exercised by
    gradients** for any expert wider than 128 (i.e. every real config).
 2. **Speed:** **10.4 ms → 6.0 ms per fwd+bwd step (1.73×, −42%)**; ~790k →
    ~1.37M tokens/s.
+3. **PyTorch 2.12 follow-up:** **5.58 ms → 4.95 ms pipelined** (another
+   1.13×, -11.3%). The variable path is now about 6% faster than the sparse
+   default on the same RTX 3090 benchmark instead of being slower.
 
 Benchmark config: RTX 3090 (Ampere), bf16, batch 8 × seq 1024, hidden 768,
 64 experts, ffn 256/expert, top_k 8.
+
+### PyTorch 2.12 follow-up
+
+After the PyTorch/STK upgrade, profiling exposed two redundant synchronizations
+and a launch-heavy topology-preparation path that were hidden by the original
+bottlenecks:
+
+- `_create_topology` already copied `padded_bins` to the host, but forward gather
+  read its last element back again. Scatter backward repeated that read despite
+  already saving the required output shape. Passing those known Python sizes
+  through reduced device-to-host copies from three per step to one.
+- `BuildTopologyKernel` now derives token-block, row, and nonzero offsets directly
+  from `padded_bins`. This removes the device `diff`, multiply, two scans, two
+  concatenations, and two zero-fills that previously prepared its inputs.
+- Router expert IDs are converted to int32 before the CUB radix sort, matching the
+  default dMoE path and halving routing key/value metadata traffic.
+- Scatter builds the original-route-to-padded-row map directly in Triton. The
+  reducer performs one mapping load instead of reconstructing an inverse with
+  `arange`, an int64 conversion, indexed assignment, and four metadata reads.
+- The expert-frequency denominator uses the statically known route count instead
+  of launching a reduction.
+
+Clean measurements (100 synchronized iterations; a separate 100-iteration batch
+for the pipelined number):
+
+| implementation | synchronized | pipelined |
+|---|---:|---:|
+| variable, before follow-up | 5.98 ms | 5.58 ms |
+| variable, final | **5.37 ms** | **4.95 ms** |
+| default dMoE, sparse STK | 5.65 ms | 5.25 ms |
 
 ---
 

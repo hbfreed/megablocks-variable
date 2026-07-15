@@ -21,6 +21,7 @@ class PaddedGatherOp(torch.autograd.Function):
         bins: torch.Tensor,
         padded_bins: torch.Tensor,
         top_k: int,
+        output_rows: int | None,
     ):
         ctx.save_for_backward(indices, bin_ids, bins, padded_bins)
         ctx.top_k = top_k
@@ -32,6 +33,7 @@ class PaddedGatherOp(torch.autograd.Function):
             bins,
             padded_bins,
             top_k,
+            output_rows,
         )
 
     @staticmethod
@@ -49,7 +51,24 @@ class PaddedGatherOp(torch.autograd.Function):
             padded_bins,
             ctx.top_k,
         )
-        return out, None, None, None, None, None
+        return out, None, None, None, None, None, None
 
 
-padded_gather = PaddedGatherOp.apply
+def padded_gather(
+    x: torch.Tensor,
+    indices: torch.Tensor,
+    bin_ids: torch.Tensor,
+    bins: torch.Tensor,
+    padded_bins: torch.Tensor,
+    top_k: int,
+    output_rows: int | None = None,
+):
+    return PaddedGatherOp.apply(
+        x,
+        indices,
+        bin_ids,
+        bins,
+        padded_bins,
+        top_k,
+        output_rows,
+    )

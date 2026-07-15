@@ -154,7 +154,16 @@ def _padded_copy(
         offsets += BLOCK_X
 
 
-def padded_gather(x, indices, bin_ids, weights, bins, padded_bins, top_k):
+def padded_gather(
+    x,
+    indices,
+    bin_ids,
+    weights,
+    bins,
+    padded_bins,
+    top_k,
+    output_rows=None,
+):
     # Validate the input shapes.
     assert_is_matrix(x)
     assert_is_vector(indices)
@@ -168,9 +177,11 @@ def padded_gather(x, indices, bin_ids, weights, bins, padded_bins, top_k):
     if weights is not None:
         assert_equal(weights.shape[0], x.shape[0] * top_k)
 
-    # NOTE: Because of the padding, the output size is dynamic.
-    # We load the final padded bin bound to get the output rows.
-    output_rows = padded_bins[-1].cpu().item()
+    # NOTE: Because of the padding, the output size is dynamic. Callers that
+    # already synchronized this value while constructing the sparse topology
+    # can pass it through and avoid draining the CUDA stream a second time.
+    if output_rows is None:
+        output_rows = padded_bins[-1].cpu().item()
     out = torch.empty((output_rows, x.shape[1]), dtype=x.dtype, device=x.device)
 
     # The copy below writes every real token row, so we only need to zero the
@@ -231,10 +242,36 @@ def gather(x, indices, bin_ids, weights, bins, top_k):
     return out
 
 
+# Map each original route to its row in the padded, expert-major matrix. Building
+# this directly avoids torch.arange + int32->int64 conversion + indexed assignment
+# and lets the scatter kernel replace four metadata loads with one.
+@triton.jit
+def _build_route_rows(
+    route_rows,
+    indices,
+    bin_ids,
+    bins,
+    padded_bins,
+    NUM_ROUTES: tl.constexpr,
+    BLOCK_X: tl.constexpr,
+):
+    sorted_pos = tl.program_id(0) * BLOCK_X + tl.arange(0, BLOCK_X)
+    mask = sorted_pos < NUM_ROUTES
+    dest = tl.load(indices + sorted_pos, mask=mask)
+    expert = tl.load(bin_ids + sorted_pos, mask=mask)
+    prev_bin = tl.load(bins + expert - 1, mask=mask & (expert > 0), other=0)
+    prev_pad = tl.load(
+        padded_bins + expert - 1,
+        mask=mask & (expert > 0),
+        other=0,
+    )
+    row = (sorted_pos - prev_bin) + prev_pad
+    tl.store(route_rows + dest, row, mask=mask)
+
+
 # One threadblock per output token. Each accumulates that token's TOP_K scattered
 # rows directly in fp32 registers, so we never materialize the (tokens, top_k,
 # hidden) intermediate that a separate .sum(dim=1) would then have to re-read.
-# inv is the inverse of `indices`: inv[dest] = sorted position holding it.
 @triton.autotune(
     configs=_COPY_CONFIGS,
     key=['NUM_COLUMNS'],
@@ -243,11 +280,8 @@ def gather(x, indices, bin_ids, weights, bins, top_k):
 def _scatter_reduce(
     out,
     x,
-    inv,
-    bin_ids,
+    route_rows,
     weights,
-    bins,
-    padded_bins,
     NUM_COLUMNS: tl.constexpr,
     TOP_K: tl.constexpr,
     BLOCK_X: tl.constexpr,
@@ -261,11 +295,7 @@ def _scatter_reduce(
         acc = tl.zeros((BLOCK_X,), dtype=tl.float32)
         for k in range(TOP_K):
             dest = token * TOP_K + k
-            pid = tl.load(inv + dest)
-            b = tl.load(bin_ids + pid)
-            prev_bin = tl.load(bins + b - 1, mask=b > 0, other=0)
-            prev_pad = tl.load(padded_bins + b - 1, mask=b > 0, other=0)
-            src_row = (pid - prev_bin) + prev_pad
+            src_row = tl.load(route_rows + dest)
             v = tl.load(x + src_row * NUM_COLUMNS + cols, mask=mask).to(tl.float32)
             if SCALE:
                 v = v * tl.load(weights + dest).to(tl.float32)
@@ -294,19 +324,25 @@ def padded_scatter(x, indices, bin_ids, weights, bins, padded_bins, top_k):
         # accumulating in fp32, so it replaces the copy + .sum(dim=1) and avoids
         # the 8x (top_k) intermediate. Accumulating in fp32 is also slightly more
         # accurate than summing the bf16 intermediate the old path produced.
-        inv = torch.empty_like(indices)
-        inv[indices.long()] = torch.arange(
-            indices.shape[0], device=indices.device, dtype=indices.dtype
+        route_rows = torch.empty(
+            indices.shape[0], device=indices.device, dtype=torch.int32
+        )
+        _build_route_rows[(triton.cdiv(indices.shape[0], 256),)](
+            route_rows,
+            indices,
+            bin_ids,
+            bins,
+            padded_bins,
+            NUM_ROUTES=indices.shape[0],
+            BLOCK_X=256,
+            num_warps=4,
         )
         out = torch.empty((tokens, x.shape[1]), dtype=x.dtype, device=x.device)
         _scatter_reduce[(tokens,)](
             out,
             x,
-            inv,
-            bin_ids,
+            route_rows,
             weights,
-            bins,
-            padded_bins,
             NUM_COLUMNS=x.shape[1],
             TOP_K=top_k,
             SCALE=weights is not None,

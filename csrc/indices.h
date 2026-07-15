@@ -88,19 +88,19 @@ namespace construct_topology {
 // connects to all of that expert's weight column-blocks).
 //
 // Per expert e (0-indexed), with:
-//   tb[e] = token-blocks, sb[e] = weight column-blocks,
-//   cbo[e] = first column-block, R[e] = first row-block,
-//   oo[e] = first non-zero-block (== output offset),
+//   padded_bins[e] = inclusive padded-token bound,
+//   sb[e] = weight column-blocks, and
+//   cbo[e] = first column-block,
 // the forward CSR is laid out (t outer, k inner) and the transpose CSC is laid
-// out (k outer, t inner) -- see the closed-form derivation in gpt_model.py.
+// out (k outer, t inner). Row and nonzero-block offsets are derived here to
+// avoid launching several tiny tensor kernels in Python.
 const int kTopoThreads = 256;
 
 __global__ void __launch_bounds__(kTopoThreads)
-  BuildTopologyKernel(const int * __restrict__ tb,
+  BuildTopologyKernel(const int * __restrict__ padded_bins,
                       const int * __restrict__ sb,
                       const int * __restrict__ cbo,
-                      const int * __restrict__ R,
-                      const int * __restrict__ oo,
+                      int block_size,
                       int block_rows,
                       int total_col,
                       int total_nnz,
@@ -111,11 +111,35 @@ __global__ void __launch_bounds__(kTopoThreads)
                       int * __restrict__ offsets_t,
                       int * __restrict__ block_offsets_t) {
   int e = blockIdx.x;
-  int tbe = __ldg(tb + e);
-  int sbe = __ldg(sb + e);
-  int cboe = __ldg(cbo + e);
-  int Re = __ldg(R + e);
-  int ooe = __ldg(oo + e);
+  __shared__ int expert_meta[5];
+  if (threadIdx.x == 0) {
+    int padded_start = e == 0 ? 0 : __ldg(padded_bins + e - 1);
+    int padded_end = __ldg(padded_bins + e);
+
+    // The nonzero-block offset is the weighted prefix sum of preceding
+    // experts' token blocks. With <= O(100) experts this small serial scan is
+    // much cheaper than materializing and scanning multiple device tensors.
+    int nonzero_start = 0;
+    int previous_end = 0;
+    for (int i = 0; i < e; ++i) {
+      int current_end = __ldg(padded_bins + i);
+      nonzero_start += ((current_end - previous_end) / block_size) * __ldg(sb + i);
+      previous_end = current_end;
+    }
+
+    expert_meta[0] = (padded_end - padded_start) / block_size;
+    expert_meta[1] = __ldg(sb + e);
+    expert_meta[2] = __ldg(cbo + e);
+    expert_meta[3] = padded_start / block_size;
+    expert_meta[4] = nonzero_start;
+  }
+  __syncthreads();
+
+  int tbe = expert_meta[0];
+  int sbe = expert_meta[1];
+  int cboe = expert_meta[2];
+  int Re = expert_meta[3];
+  int ooe = expert_meta[4];
   int eo = tbe * sbe;
 
   // Forward CSR block indices: i = t * sbe + k.
@@ -151,11 +175,10 @@ __global__ void __launch_bounds__(kTopoThreads)
   }
 }
 
-cudaError_t BuildTopology(const int * tb,
+cudaError_t BuildTopology(const int * padded_bins,
                           const int * sb,
                           const int * cbo,
-                          const int * R,
-                          const int * oo,
+                          int block_size,
                           int num_experts,
                           int block_rows,
                           int total_col,
@@ -168,7 +191,7 @@ cudaError_t BuildTopology(const int * tb,
                           int * block_offsets_t,
                           cudaStream_t stream) {
   BuildTopologyKernel<<<num_experts, kTopoThreads, 0, stream>>>(
-      tb, sb, cbo, R, oo, block_rows, total_col, total_nnz,
+      padded_bins, sb, cbo, block_size, block_rows, total_col, total_nnz,
       column_indices, row_indices, offsets,
       column_indices_t, offsets_t, block_offsets_t);
   return cudaGetLastError();
@@ -178,11 +201,10 @@ cudaError_t BuildTopology(const int * tb,
 
 // Builds all six block-sparse topology arrays in a single kernel launch,
 // replacing the CUDA indices + stk.row_indices + sort-based transpose path.
-void build_topology(torch::Tensor tb,
+void build_topology(torch::Tensor padded_bins,
                     torch::Tensor sb,
                     torch::Tensor cbo,
-                    torch::Tensor row_offsets,
-                    torch::Tensor nnz_offsets,
+                    int block_size,
                     int block_rows,
                     int total_col,
                     int total_nnz,
@@ -192,21 +214,20 @@ void build_topology(torch::Tensor tb,
                     torch::Tensor column_indices_t,
                     torch::Tensor offsets_t,
                     torch::Tensor block_offsets_t) {
-  for (auto t : {tb, sb, cbo, row_offsets, nnz_offsets, column_indices,
+  for (auto t : {padded_bins, sb, cbo, column_indices,
                  row_indices, offsets, column_indices_t, offsets_t,
                  block_offsets_t}) {
     TORCH_CHECK(t.is_cuda());
     TORCH_CHECK(t.scalar_type() == torch::kInt);
     TORCH_CHECK(t.is_contiguous());
   }
-  int num_experts = tb.numel();
-  if (num_experts == 0 || total_nnz == 0) return;
+  int num_experts = padded_bins.numel();
+  if (num_experts == 0) return;
 
-  CUDA_CALL(construct_topology::BuildTopology(tb.data_ptr<int>(),
+  CUDA_CALL(construct_topology::BuildTopology(padded_bins.data_ptr<int>(),
                                           sb.data_ptr<int>(),
                                           cbo.data_ptr<int>(),
-                                          row_offsets.data_ptr<int>(),
-                                          nnz_offsets.data_ptr<int>(),
+                                          block_size,
                                           num_experts,
                                           block_rows,
                                           total_col,

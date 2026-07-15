@@ -152,4 +152,6 @@ def testPaddedScatter(sl: int, hs: int, ne: int, top_k: int):
         _to_numpy(out),
         _to_numpy(expected_out),
         rtol=5e-3,
+        # Relative error is unstable for fp16 subnormals close to zero.
+        atol=1e-7,
     ) is None
