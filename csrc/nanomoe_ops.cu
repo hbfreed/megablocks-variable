@@ -4,7 +4,6 @@
 namespace nanomoe {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("indices_variable", &megablocks::indices, "variable-size indices construction for sparse matrix.");
   m.def("build_topology", &megablocks::build_topology, "fused variable-size block-sparse topology construction (all six arrays in one launch).");
 }
 
