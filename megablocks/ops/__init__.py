@@ -1,6 +1,10 @@
 # Copyright 2024 Databricks
 # SPDX-License-Identifier: Apache-2.0
 
+from megablocks.stk_compat import apply_stk_compatibility_fixes
+
+apply_stk_compatibility_fixes()
+
 from megablocks.ops.binned_gather import binned_gather
 from megablocks.ops.binned_scatter import binned_scatter
 from megablocks.ops.cumsum import exclusive_cumsum, inclusive_cumsum
