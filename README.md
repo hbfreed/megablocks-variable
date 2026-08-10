@@ -12,8 +12,8 @@ MegaBlocks dMoEs outperform MoEs trained with [Tutel](https://github.com/microso
 
 # :building_construction: Installation
 
-MegaBlocks supports Python 3.10+ and PyTorch 2.12.x. CUDA extensions are
-not built by default. The fused Triton serving path does not need them.
+MegaBlocks supports Python 3.10+ and PyTorch 2.11 or 2.12. CUDA extensions
+are not built by default. The fused Triton serving path does not need them.
 
 Set `MEGABLOCKS_BUILD_EXTENSIONS=1` when you need the training extensions.
 Then install the fork.
