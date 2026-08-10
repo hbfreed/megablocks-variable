@@ -19,7 +19,7 @@ Set `MEGABLOCKS_BUILD_EXTENSIONS=1` when you need the training extensions.
 Then install the fork.
 
 ```console
-MEGABLOCKS_BUILD_EXTENSIONS=1 uv sync --extra dev
+UV_TORCH_BACKEND=cu126 MEGABLOCKS_BUILD_EXTENSIONS=1 uv sync --extra dev
 ```
 
 This will build the `nanomoe_ops` CUDA extension which provides the `indices_variable` operation for variable-size expert routing.

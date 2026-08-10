@@ -48,14 +48,6 @@ all = [
     "pre-commit>=3.4.0,<4",
 ]
 
-[tool.uv.sources]
-torch = { index = "pytorch-cu126" }
-
-[[tool.uv.index]]
-name = "pytorch-cu126"
-url = "https://download.pytorch.org/whl/cu126"
-explicit = true
-
 # Pytest
 [tool.pytest.ini_options]
 # By default, run tests in README codeblocks, raise typos in fixtures as errors,
