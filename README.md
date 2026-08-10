@@ -13,12 +13,13 @@ MegaBlocks dMoEs outperform MoEs trained with [Tutel](https://github.com/microso
 # :building_construction: Installation
 
 MegaBlocks supports Python 3.10+ and PyTorch 2.12.x. CUDA extensions are
-compiled against the installed PyTorch and CUDA toolkit during installation.
+not built by default. The fused Triton serving path does not need them.
 
-**Variable-Size Experts:** To use variable-size MoEs (experts with different sizes), install from this fork with:
+Set `MEGABLOCKS_BUILD_EXTENSIONS=1` when you need the training extensions.
+Then install the fork.
 
 ```console
-uv sync --extra dev
+MEGABLOCKS_BUILD_EXTENSIONS=1 uv sync --extra dev
 ```
 
 This will build the `nanomoe_ops` CUDA extension which provides the `indices_variable` operation for variable-size expert routing.

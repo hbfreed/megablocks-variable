@@ -17,10 +17,6 @@ submodule import machinery falls through to them when ``__getattr__`` declines.
 import importlib
 from typing import Any
 
-from megablocks.stk_compat import apply_stk_compatibility_fixes
-
-apply_stk_compatibility_fixes()
-
 _LAZY = {
     'Arguments': 'megablocks.layers.arguments',
     'ParallelDroplessMLP': 'megablocks.layers.dmoe',

@@ -87,9 +87,10 @@ extra_deps['all'] = list({dep for key, deps in extra_deps.items() for dep in dep
 
 cmdclass = {}
 ext_modules = []
+build_extensions = os.environ.get('MEGABLOCKS_BUILD_EXTENSIONS', '0') == '1'
 
-# Only install CUDA extensions if available
-if 'cu' in torch.__version__ and CUDA_HOME is not None:
+# Build the training extensions only when the user requests them.
+if build_extensions and 'cu' in torch.__version__ and CUDA_HOME is not None:
 
     cmdclass = {'build_ext': BuildExtension}
     nvcc_flags = ['--ptxas-options=-v', '--optimize=2']
@@ -124,13 +125,13 @@ if 'cu' in torch.__version__ and CUDA_HOME is not None:
             },
         ),
     ]
-elif CUDA_HOME is None:
+elif build_extensions and CUDA_HOME is None:
     warnings.warn(
         'Attempted to install CUDA extensions, but CUDA_HOME was None. ' +
         'Please install CUDA and ensure that the CUDA_HOME environment ' +
         'variable points to the installation location.',
     )
-else:
+elif build_extensions:
     warnings.warn('Warning: No CUDA devices; cuda code will not be compiled.')
 
 setup(
