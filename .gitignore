@@ -153,6 +153,9 @@ README.md.bkp
 # OS X
 .DS_Store
 
+# Local profiler output
+/moe_trace.json
+
 # Sphinx
 api_reference/
 

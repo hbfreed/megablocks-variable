@@ -157,6 +157,55 @@ The gather's residual cost is scattered reads (fundamental); further wins would
 need `torch.compile` of the routing/aux-loss glue, which `stk`'s custom autograd
 currently blocks.
 
+---
+
+# Serving: fused grouped path (`megablocks/backend/fused_moe.py`)
+
+The STK path is efficient for training. Its GEMMs use 75% to 80% of the RTX
+3090 BF16 peak. Its copy kernels use approximately 930 GB/s.
+
+The STK path is not efficient for decode. It pads each active expert to 128
+rows. A decode step usually sends only one to three tokens to an expert. This
+causes unnecessary work.
+
+The measurements used one pruned Qwen3.5-MoE layer. The model has 220 experts,
+a hidden size of 2048, a top-k value of 8, and expert widths from 128 to 512.
+The STK path had the following padding ratios:
+
+- 128 times at one token.
+- 49 times at 64 tokens.
+- 13.8 times at 256 tokens.
+
+CPU dispatch was also a large part of the decode time. At one token, the layer
+used 1075 microseconds. Host enqueue work used approximately 1045 microseconds.
+
+`fused_moe.py` uses a grouped GEMM for this workload. It uses a 16-row tile
+when the route count is small. It does not build an STK topology. It uses four
+kernel launches and does not synchronize with the host. It calculates buffer
+bounds from the token count and the top-k value.
+
+| tokens | block-sparse | fused | speedup | CPU dispatch |
+|---:|---:|---:|---:|---:|
+| 1 | 1.33 ms | 0.67 ms | **1.97×** | 1292 → 646 µs |
+| 64 | 2.60 ms | 1.44 ms | **1.80×** | 2163 → 669 µs |
+| 256 | 2.88 ms | 1.64 ms | **1.75×** | 2460 → 795 µs |
+| 4096 | 5.15 ms | 4.58 ms | 1.13× | 5103 → 3074 µs |
+
+These measurements use `VariableQwenMoE.forward` on an RTX 3090. At 64 tokens,
+the estimated 40-layer GPU time decreased from 104 ms to 58 ms. The CPU
+dispatch time decreased from 86 ms to 27 ms.
+
+The fused path had a relative error of 2.87e-3 against the dense FP32
+reference. The block-sparse path had a relative error of 4.27e-3.
+
+`tests/ops/fused_moe_test.py` verifies single-token, prefill, top-k=1, and
+top-k equal to the expert count. Tests also covered 120 adversarial routing
+distributions. Compute Sanitizer reported zero memory errors.
+
+The fused path is for inference only. It does not implement backward
+operations. The static buffer bounds make CUDA graph integration possible,
+but the application must provide and test the graph wrapper.
+
 ## Verifying
 
 Timing: `profile_moe.py --variable-only`. Correctness: a dense fp32 expert-loop
