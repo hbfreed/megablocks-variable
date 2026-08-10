@@ -44,6 +44,7 @@ class GPTConfig:
     )  # 64 fine-grained experts
     num_active_experts: int = 8
     norm_topk_prob: bool = True
+    token_rounding: str = "ceil"
     load_balance_loss_weight: float = 0.08
     router_z_loss_weight: float = 0.001
     compute_loss_weight: float = 0.004
@@ -154,6 +155,12 @@ class MoEMLP(nn.Module):
         self.num_experts = sum(count for count, _ in config.expert_sizes)
         self.num_active_experts = config.num_active_experts
         self.norm_topk_prob = config.norm_topk_prob
+        self.token_rounding = config.token_rounding
+        if self.token_rounding not in {"ceil", "nearest"}:
+            raise ValueError(
+                "token_rounding must be either 'ceil' or 'nearest', got "
+                f"{self.token_rounding!r}"
+            )
         self.block_size = 128
 
         self.expert_widths = []
@@ -183,6 +190,11 @@ class MoEMLP(nn.Module):
         nn.init.trunc_normal_(self.w2, mean=0.0, std=0.02, a=-0.06, b=0.06)
 
         self.sort_end_bit = max(int(math.ceil(math.log2(self.num_experts))), 1)
+        # Keep packed (expert, descending-score) sort keys positive int32 so CUB
+        # can carry int32 permutation values as it does in the dropless path.
+        self.route_score_bits = min(20, 31 - self.sort_end_bit)
+        if self.route_score_bits < 8:
+            raise ValueError("Too many experts for score-aware int32 route keys")
 
         self._size_blocks_host = [s // self.block_size for s in self.expert_widths]
         self.register_buffer(
@@ -209,27 +221,36 @@ class MoEMLP(nn.Module):
         router_logits = self.router(x_flat)
         router_probs = F.sigmoid(router_logits.to(torch.float32))
 
-        top_k_weights, selected_experts = torch.topk(
+        top_k_scores, selected_experts = torch.topk(
             router_probs, self.num_active_experts, dim=-1
         )
 
-        top_k_weights = top_k_weights / (
-            top_k_weights.sum(dim=-1, keepdim=True) + 1e-20
+        top_k_weights = top_k_scores / (
+            top_k_scores.sum(dim=-1, keepdim=True) + 1e-20
         )
-        top_k_weights = top_k_weights.to(x.dtype)
-
-        top_k_weights_flat = rearrange(top_k_weights, "... -> (...)")
         selected_experts_flat = rearrange(selected_experts, "... -> (...)")
+        route_scores_flat = rearrange(top_k_scores, "... -> (...)")
 
+        rounding = self.token_rounding if self.training else "ceil"
         bin_ids, indices, tokens_per_expert = self._sort_tokens_by_expert(
-            selected_experts_flat
+            selected_experts_flat,
+            route_scores_flat if rounding == "nearest" else None,
+        )
+        block_tokens_per_expert = self._block_tokens_per_expert(
+            tokens_per_expert, rounding
         )
         padded_bins, topology, padded_tokens = self._create_topology(
-            x_flat, tokens_per_expert
+            x_flat, block_tokens_per_expert
         )
         # Real (unpadded) token bins are shared by the gather and scatter; compute
         # the cumsum once instead of once per call.
         bins = ops.inclusive_cumsum(tokens_per_expert, 0).contiguous()
+
+        # In nearest mode the gather/scatter kernels give dropped routes zero
+        # contribution. Keep the surviving top-k weights unchanged, matching
+        # token-dropping routing rather than adding a per-token renormalization.
+        top_k_weights = top_k_weights.to(x.dtype)
+        top_k_weights_flat = rearrange(top_k_weights, "... -> (...)")
         x_permuted = self._gather_tokens(
             x_flat, indices, bin_ids, bins, padded_bins, padded_tokens
         )
@@ -266,28 +287,62 @@ class MoEMLP(nn.Module):
             p_i, selected_experts_flat, f_i
         )
         compute_loss = p_i @ self.expert_widths_normalized.to(p_i.dtype)
+        dropped_routes = torch.clamp(
+            tokens_per_expert - block_tokens_per_expert, min=0
+        ).sum()
+        padding_routes = torch.clamp(
+            block_tokens_per_expert - tokens_per_expert, min=0
+        ).sum()
+        num_routes = selected_experts_flat.numel()
 
         aux_loss = {
             "router_z_loss": router_z_loss,
             "load_balance_loss": load_balance_loss,
             "compute_loss": compute_loss,
+            "dropped_route_fraction": dropped_routes.float() / num_routes,
+            "padding_route_fraction": padding_routes.float() / num_routes,
         }
 
         return output, aux_loss, f_i
 
-    def _sort_tokens_by_expert(self, selected_experts_flat):
+    def _sort_tokens_by_expert(self, selected_experts_flat, route_scores_flat=None):
         # CUB's radix sort carries both keys and permutation values in the input
         # dtype. Expert ids fit in int32; matching the default dMoE path halves
         # routing metadata traffic compared with sorting torch.topk's int64
         # output.
         selected_experts_flat = selected_experts_flat.int()
-        bin_ids, indices = ops.sort(selected_experts_flat, self.sort_end_bit)
         tokens_per_expert = ops.histogram(selected_experts_flat, self.num_experts)
+
+        if route_scores_flat is None:
+            bin_ids, indices = ops.sort(selected_experts_flat, self.sort_end_bit)
+            return bin_ids, indices, tokens_per_expert
+
+        # One radix sort groups routes by expert and orders each expert's routes
+        # by descending score. Quantizing positive sigmoid scores to up to 20
+        # bits is ample for deciding which routes occupy the final 128-row block and
+        # avoids two large stable sorts.
+        route_keys = ops.pack_route_keys(
+            selected_experts_flat, route_scores_flat, self.route_score_bits
+        )
+        sorted_keys, indices = ops.sort(
+            route_keys, self.sort_end_bit + self.route_score_bits
+        )
+        bin_ids = (sorted_keys >> self.route_score_bits).int()
         return bin_ids, indices, tokens_per_expert
 
-    def _create_topology(self, x, tokens_per_expert):
-        padded_tokens_per_expert = ops.round_up(tokens_per_expert, self.block_size)
-        padded_bins = ops.inclusive_cumsum(padded_tokens_per_expert, 0)
+    def _block_tokens_per_expert(self, tokens_per_expert, rounding):
+        if rounding == "ceil":
+            return ops.round_up(tokens_per_expert, self.block_size)
+
+        rounded = torch.div(
+            tokens_per_expert + self.block_size // 2,
+            self.block_size,
+            rounding_mode="trunc",
+        ) * self.block_size
+        return rounded
+
+    def _create_topology(self, x, block_tokens_per_expert):
+        padded_bins = ops.inclusive_cumsum(block_tokens_per_expert, 0)
         padded_bins = padded_bins.contiguous()
 
         # Single host sync for the whole topology build: pull the padded bins to
@@ -296,6 +351,11 @@ class MoEMLP(nn.Module):
         # for the fused topology kernel below.
         padded_bins_host = padded_bins.tolist()
         last_padded = padded_bins_host[-1]
+        if last_padded == 0:
+            raise ValueError(
+                "nearest token rounding removed every route; increase the "
+                "microbatch size or use token_rounding='ceil'"
+            )
         padded_tokens = max(last_padded, self.block_size)
         # Number of real row-blocks == sum(expert_token_blocks).
         num_row_blocks = last_padded // self.block_size

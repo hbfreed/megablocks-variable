@@ -40,6 +40,48 @@ _COPY_CONFIGS = [
 ]
 
 
+@triton.jit
+def _pack_route_keys(
+    route_keys,
+    experts,
+    scores,
+    NUM_ROUTES: tl.constexpr,
+    SCORE_BITS: tl.constexpr,
+    SCORE_SCALE: tl.constexpr,
+    BLOCK_X: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_X + tl.arange(0, BLOCK_X)
+    mask = offsets < NUM_ROUTES
+    expert = tl.load(experts + offsets, mask=mask)
+    score = tl.load(scores + offsets, mask=mask).to(tl.float32)
+    descending_score = ((1.0 - score) * SCORE_SCALE).to(tl.int32)
+    descending_score = tl.maximum(0, tl.minimum(descending_score, SCORE_SCALE))
+    key = (expert << SCORE_BITS) | descending_score
+    tl.store(route_keys + offsets, key, mask=mask)
+
+
+def pack_route_keys(experts, scores, score_bits):
+    assert_is_vector(experts)
+    assert_is_vector(scores)
+    assert_equal(experts.shape[0], scores.shape[0])
+    if experts.dtype != torch.int32:
+        raise ValueError(f'Expected int32 experts but got {experts.dtype}.')
+
+    out = torch.empty_like(experts)
+    score_scale = (1 << score_bits) - 1
+    _pack_route_keys[(triton.cdiv(experts.shape[0], 256),)](
+        out,
+        experts,
+        scores,
+        NUM_ROUTES=experts.shape[0],
+        SCORE_BITS=score_bits,
+        SCORE_SCALE=score_scale,
+        BLOCK_X=256,
+        num_warps=4,
+    )
+    return out
+
+
 # a: (padded_rows, hidden), the destination of padded_gather.
 # bins:        (num_experts,) inclusive cumsum of *real* tokens per expert.
 # padded_bins: (num_experts,) inclusive cumsum of *padded* tokens per expert.
@@ -64,9 +106,13 @@ def _zero_padding(
     prev_pad = tl.load(padded_bins + expert - 1, mask=expert > 0, other=0)
     pad_end = tl.load(padded_bins + expert)
 
-    # The real tokens occupy [prev_pad, prev_pad + num_real); zero the rest.
+    # The retained real tokens occupy [prev_pad, prev_pad + num_kept). In the
+    # usual dropless path capacity >= num_real; nearest-block routing can make
+    # capacity smaller and drops the tail of the score-sorted expert bin.
     num_real = real_end - prev_real
-    start = (prev_pad + num_real) * NUM_COLUMNS
+    capacity = pad_end - prev_pad
+    num_kept = tl.minimum(num_real, capacity)
+    start = (prev_pad + num_kept) * NUM_COLUMNS
     end = pad_end * NUM_COLUMNS
 
     col = tl.arange(0, BLOCK_X)
@@ -104,8 +150,8 @@ def _padded_copy(
     # Our index into array 'a'.
     index_a = tl.load(indices + tl.program_id(0))
 
-    # One threadblock per row in 'a'. Array 'b' has greater or equal
-    # number of rows since they could be padded.
+    # One threadblock per route. In nearest mode the expert-major array can be
+    # smaller because low-scoring routes at the tail of a bin are dropped.
     bin_idx = tl.load(bin_ids + tl.program_id(0))
 
     # Now we know what bin we're assigned to, but we need to know how
@@ -115,10 +161,17 @@ def _padded_copy(
     if bin_idx > 0:
         offset_in_bin -= tl.load(bins + bin_idx - 1)
 
+    prev_pad = tl.load(
+        padded_bins + bin_idx - 1,
+        mask=bin_idx > 0,
+        other=0,
+    )
+    pad_end = tl.load(padded_bins + bin_idx)
+    keep = offset_in_bin < (pad_end - prev_pad)
+
     # Load the starting index of our bin in array 'b'.
     index_b = offset_in_bin
-    if bin_idx > 0:
-        index_b += tl.load(padded_bins + bin_idx - 1)
+    index_b += prev_pad
 
     # Offset the input and output pointers.
     #
@@ -141,7 +194,12 @@ def _padded_copy(
     iterations = tl.cdiv(NUM_COLUMNS, BLOCK_X)
     for _ in range(iterations):
         mask = offsets < NUM_COLUMNS
-        x = tl.load(iptr + offsets, mask=mask)
+        if A_TO_B:
+            x = tl.load(iptr + offsets, mask=mask)
+        else:
+            # A dropped route has no row in the expert-major input. Materialize
+            # a zero contribution in the token-major output instead.
+            x = tl.load(iptr + offsets, mask=mask & keep, other=0)
 
         # When not scaling this is a pure copy: skipping the fp32 round-trip is
         # bit-identical (bf16 -> fp32 -> bf16 is the identity) and avoids the
@@ -149,7 +207,10 @@ def _padded_copy(
         if SCALE:
             x = (x.to(tl.float32) * scale).to(optr.dtype.element_ty)
 
-        tl.store(optr + offsets, x, mask=mask)
+        if A_TO_B:
+            tl.store(optr + offsets, x, mask=mask & keep)
+        else:
+            tl.store(optr + offsets, x, mask=mask)
 
         offsets += BLOCK_X
 
@@ -265,8 +326,60 @@ def _build_route_rows(
         mask=mask & (expert > 0),
         other=0,
     )
-    row = (sorted_pos - prev_bin) + prev_pad
+    pad_end = tl.load(padded_bins + expert, mask=mask)
+    offset_in_bin = sorted_pos - prev_bin
+    keep = offset_in_bin < (pad_end - prev_pad)
+    row = tl.where(keep, offset_in_bin + prev_pad, -1)
     tl.store(route_rows + dest, row, mask=mask)
+
+
+# Build a mask in original token-major route order for route accounting and
+# direct testing of nearest-block selection.
+@triton.jit
+def _build_padded_route_mask(
+    route_mask,
+    indices,
+    bin_ids,
+    bins,
+    padded_bins,
+    NUM_ROUTES: tl.constexpr,
+    BLOCK_X: tl.constexpr,
+):
+    sorted_pos = tl.program_id(0) * BLOCK_X + tl.arange(0, BLOCK_X)
+    mask = sorted_pos < NUM_ROUTES
+    dest = tl.load(indices + sorted_pos, mask=mask)
+    expert = tl.load(bin_ids + sorted_pos, mask=mask)
+    prev_bin = tl.load(bins + expert - 1, mask=mask & (expert > 0), other=0)
+    prev_pad = tl.load(
+        padded_bins + expert - 1,
+        mask=mask & (expert > 0),
+        other=0,
+    )
+    pad_end = tl.load(padded_bins + expert, mask=mask)
+    keep = (sorted_pos - prev_bin) < (pad_end - prev_pad)
+    tl.store(route_mask + dest, keep, mask=mask)
+
+
+def padded_route_mask(indices, bin_ids, bins, padded_bins):
+    assert_is_vector(indices)
+    assert_is_vector(bin_ids)
+    assert_is_vector(bins)
+    assert_is_vector(padded_bins)
+    assert_equal(indices.shape[0], bin_ids.shape[0])
+    assert_equal(bins.size(), padded_bins.size())
+
+    out = torch.empty(indices.shape[0], dtype=torch.bool, device=indices.device)
+    _build_padded_route_mask[(triton.cdiv(indices.shape[0], 256),)](
+        out,
+        indices,
+        bin_ids,
+        bins,
+        padded_bins,
+        NUM_ROUTES=indices.shape[0],
+        BLOCK_X=256,
+        num_warps=4,
+    )
+    return out
 
 
 # One threadblock per output token. Each accumulates that token's TOP_K scattered
@@ -296,7 +409,13 @@ def _scatter_reduce(
         for k in range(TOP_K):
             dest = token * TOP_K + k
             src_row = tl.load(route_rows + dest)
-            v = tl.load(x + src_row * NUM_COLUMNS + cols, mask=mask).to(tl.float32)
+            keep = src_row >= 0
+            safe_src_row = tl.maximum(src_row, 0)
+            v = tl.load(
+                x + safe_src_row * NUM_COLUMNS + cols,
+                mask=mask & keep,
+                other=0,
+            ).to(tl.float32)
             if SCALE:
                 v = v * tl.load(weights + dest).to(tl.float32)
             acc += v
@@ -398,8 +517,8 @@ def _padded_copy_wgrad(
     # Our index into 'tokens * top_k'.
     index_out = tl.load(indices + tl.program_id(0))
 
-    # One threadblock per row in 'a'. Array 'b' has greater or equal
-    # number of rows since they could be padded.
+    # One threadblock per route. The expert-major input has no row for a route
+    # dropped by nearest-block rounding.
     bin_idx = tl.load(bin_ids + tl.program_id(0))
 
     # Now we know what bin we're assigned to, but we need to know how
@@ -409,10 +528,17 @@ def _padded_copy_wgrad(
     if bin_idx > 0:
         offset_in_bin -= tl.load(bins + bin_idx - 1)
 
+    prev_pad = tl.load(
+        padded_bins + bin_idx - 1,
+        mask=bin_idx > 0,
+        other=0,
+    )
+    pad_end = tl.load(padded_bins + bin_idx)
+    keep = offset_in_bin < (pad_end - prev_pad)
+
     # Load the starting index of our bin in array 'x'.
     index_x = offset_in_bin
-    if bin_idx > 0:
-        index_x += tl.load(padded_bins + bin_idx - 1)
+    index_x += prev_pad
 
     # Offset the input and output pointers.
     wgrad += index_out
@@ -423,9 +549,9 @@ def _padded_copy_wgrad(
     acc = tl.zeros((BLOCK_X,), dtype=tl.float32)
     iterations = tl.cdiv(NUM_COLUMNS, BLOCK_X)
     for _ in range(iterations):
-        mask = offsets < NUM_COLUMNS
-        data = tl.load(x + offsets, mask=mask).to(tl.float32)
-        scale = tl.load(grad + offsets, mask=mask).to(tl.float32)
+        mask = (offsets < NUM_COLUMNS) & keep
+        data = tl.load(x + offsets, mask=mask, other=0).to(tl.float32)
+        scale = tl.load(grad + offsets, mask=mask, other=0).to(tl.float32)
         acc += data * scale
         offsets += BLOCK_X
 
