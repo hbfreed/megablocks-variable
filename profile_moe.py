@@ -28,6 +28,12 @@ def parse_args():
     parser.add_argument("--hidden-size", type=int, default=768)
     parser.add_argument("--num-experts", type=int, default=64)
     parser.add_argument("--top-k", type=int, default=8)
+    parser.add_argument(
+        "--token-rounding",
+        choices=["ceil", "nearest"],
+        default="ceil",
+        help="Per-expert 128-row block rounding policy for the variable MoE",
+    )
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument(
@@ -133,8 +139,12 @@ def profile_variable_moe(args, num_tokens):
         use_moe=True,
         expert_sizes=[(args.num_experts, 256)],  # Must be divisible by 128
         num_active_experts=args.top_k,
+        token_rounding=args.token_rounding,
     )
-    print(f"Expert config: {config.expert_sizes}")
+    print(
+        f"Expert config: {config.expert_sizes}, "
+        f"token rounding: {config.token_rounding}"
+    )
 
     moe = MoEMLP(config)
     moe.cuda().bfloat16()
@@ -147,6 +157,14 @@ def profile_variable_moe(args, num_tokens):
         device="cuda",
         dtype=torch.bfloat16,
         requires_grad=True,
+    )
+
+    with torch.no_grad():
+        _, routing_stats, _ = moe(x)
+    print(
+        "Route accounting: "
+        f"{float(routing_stats['dropped_route_fraction']) * 100:.2f}% dropped, "
+        f"{float(routing_stats['padding_route_fraction']) * 100:.2f}% padded"
     )
 
     def train_step():

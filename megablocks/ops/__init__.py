@@ -6,7 +6,9 @@ from megablocks.ops.binned_scatter import binned_scatter
 from megablocks.ops.cumsum import exclusive_cumsum, inclusive_cumsum
 from megablocks.ops.gather import gather
 from megablocks.ops.histogram import histogram
+from megablocks.ops.pack_route_keys import pack_route_keys
 from megablocks.ops.padded_gather import padded_gather
+from megablocks.ops.padded_route_mask import padded_route_mask
 from megablocks.ops.padded_scatter import padded_scatter
 from megablocks.ops.repeat import repeat
 from megablocks.ops.replicate import replicate
@@ -23,7 +25,9 @@ __all__ = [
     'inclusive_cumsum',
     'gather',
     'histogram',
+    'pack_route_keys',
     'padded_gather',
+    'padded_route_mask',
     'padded_scatter',
     'repeat',
     'replicate',
