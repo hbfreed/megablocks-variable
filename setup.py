@@ -107,15 +107,6 @@ if build_extensions and 'cu' in torch.__version__ and CUDA_HOME is not None:
 
     ext_modules = [
         CUDAExtension(
-            'megablocks_ops',
-            ['csrc/ops.cu'],
-            include_dirs=['csrc'],
-            extra_compile_args={
-                'cxx': ['-fopenmp'],
-                'nvcc': nvcc_flags,
-            },
-        ),
-        CUDAExtension(
             'nanomoe_ops',
             ['csrc/nanomoe_ops.cu'],
             include_dirs=['csrc'],

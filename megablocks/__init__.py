@@ -4,8 +4,8 @@
 
 Upstream's model-layer classes (dMoE, MoE, SparseMLP, ...) are removed: every
 consumer of this fork builds its own modules and uses only ``megablocks.ops``,
-``megablocks.backend`` and ``megablocks.layers.relu_squared``. Keeping this
-module import-free also keeps the pure-Triton serving path
-(``megablocks.backend.fused_moe``) importable without the compiled
-``megablocks_ops`` extension.
+``megablocks.backend`` and ``megablocks.layers.relu_squared``. The CUB-backed
+sort/histogram/cumsum extension is gone too — those ops are plain torch now —
+so the only compiled piece left is ``nanomoe_ops`` (topology construction),
+and only the stk training path needs it.
 """
