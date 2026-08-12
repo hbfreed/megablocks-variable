@@ -213,3 +213,32 @@ reference (see the bug table) — **not** the old pristine baseline, which is bu
 Full fwd+bwd (output, aux losses, all grads) is bit-identical to the corrected
 sort-based path. (`tests/` can't run out of the box: `conftest.py` imports
 `composer`, which isn't installed.)
+
+## Persistent-kernel experiment (2026-08-12, negative result)
+
+Hypothesis: `_gate_up_silu` launches a rectangular `(m_tiles, max_nblocks)`
+grid and relies on early-exit for dead tiles, because the grid must be
+host-sized while the real work count is device-resident. On the served keep50
+checkpoint (16 layers, ~55 experts, widths 128-1024, top_k 8) the over-launch
+is 2.0-2.6x for gate/up and 1.3-1.6x for down. A persistent kernel (fixed
+grid, CTAs stride over the work) should recover that waste.
+
+Two variants, measured on one RTX 3090 at the served shape:
+
+1. Stride over row tiles, inner loop over the expert's width blocks.
+   0.38x at 1 token, 0.68x at 2048. The inner loop serializes work that the
+   2D grid ran as parallel CTAs; at decode the SMs are idle, so the lost
+   parallelism costs far more than the dead CTAs did.
+2. Stride over the flat `(row tile, width block)` index space, dead pairs
+   skipped in-loop. 0.97-1.04x for 1-256 tokens, 0.67x at 2048 tokens
+   (the outer loop defeats Triton's software pipelining of the K loop, and
+   the capped grid gives up wave oversubscription).
+
+Conclusion: dead CTAs cost almost nothing here. They exit after two scalar
+loads, and the kernel is weight-bandwidth-bound, so the 2D grid with
+early-exit is the right design on Ampere. Do not retry persistence for its
+own sake; it becomes interesting again only with TMA/warp-specialization
+(Hopper+) or if a megakernel fuses gate/up -> down through shared memory.
+
+Both variants passed the full `fused_moe_test.py` matrix (25 cases) before
+being reverted; correctness was not the problem.
