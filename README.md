@@ -1,65 +1,123 @@
-# :robot: MegaBlocks
+# MegaBlocks Variable
 
-MegaBlocks is a light-weight library for mixture-of-experts (MoE) training. The core of the system is efficient "dropless-MoE" ([dMoE](megablocks/layers/dmoe.py), [paper](https://arxiv.org/abs/2211.15841)) and standard [MoE](megablocks/layers/moe.py) layers. This fork adds support for variable-size MoEs, allowing experts to have different sizes.
+High-performance GPU kernels for mixture-of-experts models whose experts have
+different intermediate widths.
 
-MegaBlocks is integrated with [Megatron-LM](https://github.com/NVIDIA/Megatron-LM), where we support data, expert and pipeline parallel training of MoEs. Stay tuned for tighter integration with Databricks libraries and tools!
+MegaBlocks Variable began as a fork of
+[Databricks MegaBlocks](https://github.com/databricks/megablocks) and now
+evolves as an independent project. It preserves the upstream Git history,
+license, and attribution, while focusing narrowly on variable-width routing,
+inference, and training.
 
-# :rocket: Performance
+## What is here
 
-![MegaBlocks Performance](media/dropping_end_to_end.png)
+- A fused Triton inference path with device-side counting-sort routing and
+  row tiles sized for decode and prefill.
+- A differentiable grouped-MoE training path with deterministic forward and
+  backward kernels and no STK dependency.
+- An optional CuTe DSL backend for the dominant Ampere training GEMMs.
+- Score-aware nearest-block route dropping for reducing training padding.
+- Extension-free installation for the default Triton paths.
 
-MegaBlocks dMoEs outperform MoEs trained with [Tutel](https://github.com/microsoft/tutel) by up to **40%** compared to Tutel's best performing `capacity_factor` configuration. MegaBlocks dMoEs use a reformulation of MoEs in terms of block-sparse operations, which allows us to avoid token dropping without sacrificing hardware efficiency. In addition to being faster, MegaBlocks simplifies MoE training by removing the `capacity_factor` hyperparameter altogether. Compared to dense Transformers trained with [Megatron-LM](https://github.com/NVIDIA/Megatron-LM), MegaBlocks dMoEs can accelerate training by as much as **2.4x**. Check out our [paper](https://arxiv.org/abs/2211.15841) for more details!
+The implementation is intentionally compact. Legacy upstream model layers and
+unused sparse operations were removed; this package is a kernel backend for
+projects that own their model and routing layers.
 
-# :building_construction: Installation
+## Performance
 
-MegaBlocks supports Python 3.10+ and PyTorch 2.11 or 2.12. CUDA extensions
-are not built by default. The fused Triton serving path does not need them.
+On an RTX 3090, the fused variable-width serving path improved measured
+keep-50 Qwen3.5-MoE decode throughput from 688 to 1536 tok/s (2.21x) while
+preserving greedy continuations.
 
-Set `MEGABLOCKS_BUILD_EXTENSIONS=1` when you need the training extensions.
-Then install the fork.
+For one keep-50 training layer with 4096 tokens, hidden size 2048, and top-k 8,
+150 rotated measurements on the locked Torch 2.12.1 / CUDA 12.6 stack gave:
+
+| backend | forward + backward |
+|---|---:|
+| tuned Triton | 16.491 ms |
+| CuTe, recompute activation | 15.626 ms |
+| CuTe, retain activation | **15.264 ms** |
+
+The CuTe path with retained activation was 7.1% faster than the final Triton
+path in paired measurements and roughly 10% faster than the pre-optimization
+training implementation. See
+[`KERNEL_OPTIMIZATION.md`](KERNEL_OPTIMIZATION.md) for methodology, rejected
+fusions, memory tradeoffs, and shape-specific results.
+
+## Installation
+
+MegaBlocks Variable currently keeps the Python import/package name
+`megablocks` for downstream compatibility. Install this repository explicitly;
+`pip install megablocks` may resolve the upstream Databricks distribution.
 
 ```console
-UV_TORCH_BACKEND=cu126 MEGABLOCKS_BUILD_EXTENSIONS=1 uv sync --extra dev
+uv pip install "megablocks @ git+https://github.com/hbfreed/megablocks-variable.git"
 ```
 
-This will build the `nanomoe_ops` CUDA extension which provides the `indices_variable` operation for variable-size expert routing.
+For an editable development environment:
 
-**Training models with Megatron-LM:** We recommend the PyTorch 2.12.1,
-CUDA 12.6 development image used by the [Dockerfile](Dockerfile). To build the
-image, run `docker build . -t megablocks-dev` and then `bash docker.sh` to
-launch the container. Once inside the container, install MegaBlocks with
-`pip install .`. See [Usage](#steam_locomotive-usage) for instructions on
-training MoEs with MegaBlocks + Megatron-LM.
-
-**Using MegaBlocks in other packages:** To install the MegaBlocks package for use in other frameworks, run `pip install megablocks`. For example, [Mixtral-8x7B](https://mistral.ai/news/mixtral-of-experts/) can be run with [vLLM](https://github.com/vllm-project/vllm) + MegaBlocks with this installation method.
-
-**Extras:** MegaBlocks has optional dependencies that enable additional features.
-
-Installing `megablocks[gg]` enables dMoE computation with grouped GEMM. This feature is enabled by setting the `mlp_impl` argument to `grouped`. This is currently our recommended path for Hopper-generation GPUs.
-
-Installing `megablocks[cute]` enables the experimental CuTe DSL GEMM suite for
-the variable-width grouped training backend. It accelerates the down
-projection, input gradient, and down-projection weight gradient; the remaining
-kernels use Triton. It currently targets BF16 on Ampere (compute capability
-8.x) and is selected explicitly with
-`grouped_moe(..., down_proj_backend="cute")`; Triton remains the default.
-For maximum training speed, `recompute_activation=False` retains the forward
-SwiGLU activation for backward; the default recomputes it to reduce saved
-activation memory.
-
-Installing `megablocks[dev]` allows you to contribute to MegaBlocks and test
-locally. If you've installed `megablocks[dev]`, you can run `pre-commit
-install` to configure the pre-commit hook to automatically format the code.
-
-MegaBlocks can be installed with all dependencies (except for `testing`) via the `megablocks[all]` package.
-
-# :steam_locomotive: Usage
-
-We provide scripts for pre-training Transformer MoE and dMoE language models under the [top-level directory](megablocks/). The quickest way to get started is to use one of the [experiment launch scripts](exp/). These scripts require a dataset in Megatron-LM's format, which can be created by following their [instructions](https://github.com/NVIDIA/Megatron-LM#data-preprocessing).
-
-# :writing_hand: Citation
-
+```console
+git clone https://github.com/hbfreed/megablocks-variable.git
+cd megablocks-variable
+UV_TORCH_BACKEND=cu126 uv sync --extra dev
 ```
+
+The default Triton paths do not build CUDA extensions. Set
+`MEGABLOCKS_BUILD_EXTENSIONS=1` only for legacy consumers that still need
+`nanomoe_ops.indices_variable`.
+
+### Optional CuTe training backend
+
+Install the CuTe extra:
+
+```console
+UV_TORCH_BACKEND=cu126 uv sync --extra cute
+```
+
+The current CuTe implementation targets BF16 on Ampere (compute capability
+8.x) with hidden sizes divisible by 256. Select it explicitly:
+
+```python
+output = grouped_moe(
+    x,
+    top_weights,
+    expert_ids,
+    plan,
+    top_k,
+    w_gate,
+    w_up,
+    w_down,
+    down_proj_backend="cute",
+    recompute_activation=False,
+)
+```
+
+`recompute_activation=False` is the fastest mode but retains about 77.5 MiB
+for the measured layer shape. Keep the default `True` when activation memory
+is more valuable than the roughly 0.31 ms backward improvement.
+
+## Tests
+
+GPU operator tests are marked explicitly:
+
+```console
+pytest -m gpu tests/ops
+```
+
+The Triton and CuTe training changes were validated with 226 single-GPU
+operator cases. The optional CuTe tests require its dependencies and Ampere
+hardware.
+
+## Project history and attribution
+
+The descriptions of the eight pull requests merged before this repository
+left the GitHub fork network are preserved in
+[`docs/pull-request-history.md`](docs/pull-request-history.md). All commits and
+authorship remain in Git.
+
+MegaBlocks Variable is based on the original MegaBlocks work:
+
+```bibtex
 @article{megablocks,
   title={{MegaBlocks: Efficient Sparse Training with Mixture-of-Experts}},
   author={Trevor Gale and Deepak Narayanan and Cliff Young and Matei Zaharia},
@@ -68,3 +126,5 @@ We provide scripts for pre-training Transformer MoE and dMoE language models und
   year={2023}
 }
 ```
+
+See [`LICENSE`](LICENSE) and file-level notices for licensing and attribution.
