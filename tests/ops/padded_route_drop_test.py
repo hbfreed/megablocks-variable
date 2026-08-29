@@ -17,7 +17,7 @@ def test_score_sorted_nearest_rounding_drops_lowest_route():
             expert_sizes=[(2, 128)],
             num_active_experts=1,
             token_rounding="nearest",
-        )
+        ),
     ).cuda()
 
     experts = torch.tensor([0] * 129 + [1] * 127, device="cuda")
@@ -25,7 +25,7 @@ def test_score_sorted_nearest_rounding_drops_lowest_route():
     scores[3] = 0.0
 
     bin_ids, indices, tokens_per_expert = moe._sort_tokens_by_expert(
-        experts, scores
+        experts, scores,
     )
     block_tokens = moe._block_tokens_per_expert(tokens_per_expert, "nearest")
     bins = ops.inclusive_cumsum(tokens_per_expert, 0)
@@ -68,10 +68,10 @@ def test_dropped_routes_are_zero_in_forward_and_backward(top_k: int):
     x = torch.randn(tokens, hidden, device="cuda", dtype=torch.float16, requires_grad=True)
     weights = torch.randn(num_routes, device="cuda", dtype=torch.float16, requires_grad=True)
     gathered = ops.padded_gather(
-        x, indices, bin_ids, bins, padded_bins, top_k, output_rows=256
+        x, indices, bin_ids, bins, padded_bins, top_k, output_rows=256,
     )
     out = ops.padded_scatter(
-        gathered, indices, bin_ids, weights, bins, padded_bins, top_k
+        gathered, indices, bin_ids, weights, bins, padded_bins, top_k,
     )
 
     ref_x = x.detach().clone().requires_grad_(True)
@@ -89,7 +89,7 @@ def test_dropped_routes_are_zero_in_forward_and_backward(top_k: int):
     expected.backward(grad)
     torch.testing.assert_close(x.grad, ref_x.grad, rtol=5e-3, atol=5e-3)
     torch.testing.assert_close(
-        weights.grad, ref_weights.grad, rtol=5e-3, atol=5e-3
+        weights.grad, ref_weights.grad, rtol=5e-3, atol=5e-3,
     )
     assert torch.count_nonzero(weights.grad[~expected_mask]).item() == 0
 
@@ -105,7 +105,7 @@ def test_nearest_rounding_runs_full_moe_forward_and_backward():
             expert_sizes=[(2, 128)],
             num_active_experts=1,
             token_rounding="nearest",
-        )
+        ),
     ).cuda().train()
     with torch.no_grad():
         moe.router.weight[0].fill_(1)

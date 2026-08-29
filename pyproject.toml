@@ -9,12 +9,15 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "megablocks"
 version = "0.11.0.dev0"
-description = "MegaBlocks: Efficient Sparse Training with Mixture-of-Experts"
+description = "GPU kernels for variable-width mixture-of-experts inference and training"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
 authors = [
     {name = "Trevor Gale", email = "tgale@stanford.edu"},
+]
+maintainers = [
+    {name = "Henry Freed", email = "hbfreed@protonmail.com"},
 ]
 dependencies = [
     "numpy>=1.21.5,<2.1.0",
@@ -23,6 +26,12 @@ dependencies = [
     "stanford-stk==0.7.1",
     "einops",
 ]
+
+[project.urls]
+Homepage = "https://github.com/hbfreed/megablocks-variable"
+Repository = "https://github.com/hbfreed/megablocks-variable.git"
+Issues = "https://github.com/hbfreed/megablocks-variable/issues"
+Upstream = "https://github.com/databricks/megablocks"
 
 [project.optional-dependencies]
 gg = [

@@ -37,7 +37,7 @@ def parse_args():
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument(
-        "--variable-only", action="store_true", help="Only profile variable MoE"
+        "--variable-only", action="store_true", help="Only profile variable MoE",
     )
     parser.add_argument("--dmoe-only", action="store_true", help="Only profile dMoE")
     parser.add_argument("--mlp-impl", type=str, default="grouped", choices=["grouped", "sparse"],
@@ -143,7 +143,7 @@ def profile_variable_moe(args, num_tokens):
     )
     print(
         f"Expert config: {config.expert_sizes}, "
-        f"token rounding: {config.token_rounding}"
+        f"token rounding: {config.token_rounding}",
     )
 
     moe = MoEMLP(config)
@@ -164,7 +164,7 @@ def profile_variable_moe(args, num_tokens):
     print(
         "Route accounting: "
         f"{float(routing_stats['dropped_route_fraction']) * 100:.2f}% dropped, "
-        f"{float(routing_stats['padding_route_fraction']) * 100:.2f}% padded"
+        f"{float(routing_stats['padding_route_fraction']) * 100:.2f}% padded",
     )
 
     def train_step():
@@ -252,10 +252,10 @@ def main():
         print("COMPARISON")
         print("=" * 70)
         print(
-            f"  dMoE (uniform):     {dmoe_time:.3f} ms  ({num_tokens / dmoe_time * 1000:.0f} tok/s)"
+            f"  dMoE (uniform):     {dmoe_time:.3f} ms  ({num_tokens / dmoe_time * 1000:.0f} tok/s)",
         )
         print(
-            f"  Variable MoE:       {var_time:.3f} ms  ({num_tokens / var_time * 1000:.0f} tok/s)"
+            f"  Variable MoE:       {var_time:.3f} ms  ({num_tokens / var_time * 1000:.0f} tok/s)",
         )
         print(f"  Slowdown:           {var_time / dmoe_time:.2f}x")
 

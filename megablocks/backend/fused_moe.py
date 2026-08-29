@@ -327,7 +327,7 @@ def fused_moe_forward(
         raise ValueError(f'expected hidden {plan.hidden_size}, got {hidden}')
     if expert_ids.numel() != num_routes:
         raise ValueError(
-            f'expected {num_routes} expert ids, got {expert_ids.numel()}'
+            f'expected {num_routes} expert ids, got {expert_ids.numel()}',
         )
 
     bn = plan.block_n

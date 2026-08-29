@@ -1,29 +1,23 @@
-# What does this PR do?
+## Summary
+
+<!-- What changed, and what problem does it solve? -->
+
+## Validation
+
+<!-- List the exact checks you ran. Include correctness tolerances where relevant. -->
+
+## Performance
 
 <!--
-Please briefly describe your change, including what problem the change fixes, and any context
-necessary for understanding the change
+For kernel changes, include hardware/software versions, shapes, warmup and
+sample counts, and paired before/after measurements. Write "Not applicable"
+for changes that cannot affect performance.
 -->
 
-# What issue(s) does this change relate to?
+## Checklist
 
-<!--
-Please include any issues related to this pull request, including 'Fixes' if the issue is resolved
-by this pull request.
-Example:
-- Fixes #42
-- Related to #1234
--->
-
-# Before submitting
-- [ ] Have you read the [contributor guidelines](https://github.com/databricks/megablocks/blob/dev/CONTRIBUTING.md)?
-- [ ] Is this change a documentation change or typo fix? If so, skip the rest of this checklist.
-- [ ] Was this change discussed/approved in a GitHub issue first? It is much more likely to be merged if so.
-- [ ] Did you update any related docs and document your change?
-- [ ] Did you update any related tests and add any new tests related to your change? (see [testing](https://github.com/databricks/megablocks/blob/dev/CONTRIBUTING.md#running-tests))
-- [ ] Did you run the tests locally to make sure they pass?
-- [ ] Did you run `pre-commit` on your change? (see the `pre-commit` section of [prerequisites](https://github.com/databricks/megablocks/blob/dev/CONTRIBUTING.md#prerequisites))
-
-<!--
-Thanks so much for contributing to MegaBlocks! We really appreciate it :)
--->
+- [ ] I read the [contribution guide](https://github.com/hbfreed/megablocks-variable/blob/main/CONTRIBUTING.md).
+- [ ] I added or updated tests and documentation where appropriate.
+- [ ] I ran `uvx --from ruff==0.11.12 ruff check .` and `uv lock --check`.
+- [ ] I documented any relevant tests that I could not run locally.
+- [ ] I preserved attribution and license notices for adapted code.

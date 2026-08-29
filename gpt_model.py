@@ -40,7 +40,7 @@ class GPTConfig:
     n_embd: int = 768
     use_moe: bool = True
     expert_sizes: list = field(
-        default_factory=lambda: [(64, 256)]
+        default_factory=lambda: [(64, 256)],
     )  # 64 fine-grained experts
     num_active_experts: int = 8
     norm_topk_prob: bool = True
@@ -112,11 +112,11 @@ class CausalSelfAttention(nn.Module):
         enable_gqa = self.n_head != self.n_kv_head
         if kv_cache is None or Tq == Tk:
             y = F.scaled_dot_product_attention(
-                q, k, v, is_causal=True, enable_gqa=enable_gqa
+                q, k, v, is_causal=True, enable_gqa=enable_gqa,
             )
         elif Tq == 1:
             y = F.scaled_dot_product_attention(
-                q, k, v, is_causal=False, enable_gqa=enable_gqa
+                q, k, v, is_causal=False, enable_gqa=enable_gqa,
             )
         else:
             attn_mask = torch.zeros((Tq, Tk), dtype=torch.bool, device=q.device)
@@ -124,10 +124,10 @@ class CausalSelfAttention(nn.Module):
             if prefix_len > 0:
                 attn_mask[:, :prefix_len] = True
             attn_mask[:, prefix_len:] = torch.tril(
-                torch.ones((Tq, Tq), dtype=torch.bool, device=q.device)
+                torch.ones((Tq, Tq), dtype=torch.bool, device=q.device),
             )
             y = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa
+                q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa,
             )
 
         y = y.transpose(1, 2).contiguous().view(B, T, -1)
@@ -159,7 +159,7 @@ class MoEMLP(nn.Module):
         if self.token_rounding not in {"ceil", "nearest"}:
             raise ValueError(
                 "token_rounding must be either 'ceil' or 'nearest', got "
-                f"{self.token_rounding!r}"
+                f"{self.token_rounding!r}",
             )
         self.block_size = 128
 
@@ -176,7 +176,7 @@ class MoEMLP(nn.Module):
         self.register_buffer(
             "expert_widths_normalized",
             torch.tensor(
-                [w / mean_expert_width for w in self.expert_widths], dtype=torch.float32
+                [w / mean_expert_width for w in self.expert_widths], dtype=torch.float32,
             ),
             persistent=False,
         )
@@ -205,7 +205,7 @@ class MoEMLP(nn.Module):
         self.register_buffer(
             "expert_block_offsets",
             torch.tensor(
-                [o // self.block_size for o in self.expert_offsets], dtype=torch.int32
+                [o // self.block_size for o in self.expert_offsets], dtype=torch.int32,
             ),
             persistent=False,
         )
@@ -215,14 +215,14 @@ class MoEMLP(nn.Module):
         batch_size, seq_len, n_embd = x.shape
 
         x_flat = rearrange(
-            x, "batch_size seq_len n_embd -> (batch_size seq_len) n_embd "
+            x, "batch_size seq_len n_embd -> (batch_size seq_len) n_embd ",
         )
 
         router_logits = self.router(x_flat)
         router_probs = F.sigmoid(router_logits.to(torch.float32))
 
         top_k_scores, selected_experts = torch.topk(
-            router_probs, self.num_active_experts, dim=-1
+            router_probs, self.num_active_experts, dim=-1,
         )
 
         top_k_weights = top_k_scores / (
@@ -237,10 +237,10 @@ class MoEMLP(nn.Module):
             route_scores_flat if rounding == "nearest" else None,
         )
         block_tokens_per_expert = self._block_tokens_per_expert(
-            tokens_per_expert, rounding
+            tokens_per_expert, rounding,
         )
         padded_bins, topology, padded_tokens = self._create_topology(
-            x_flat, block_tokens_per_expert
+            x_flat, block_tokens_per_expert,
         )
         # Real (unpadded) token bins are shared by the gather and scatter; compute
         # the cumsum once instead of once per call.
@@ -252,7 +252,7 @@ class MoEMLP(nn.Module):
         top_k_weights = top_k_weights.to(x.dtype)
         top_k_weights_flat = rearrange(top_k_weights, "... -> (...)")
         x_permuted = self._gather_tokens(
-            x_flat, indices, bin_ids, bins, padded_bins, padded_tokens
+            x_flat, indices, bin_ids, bins, padded_bins, padded_tokens,
         )
         x_permuted = stk.ops.sdd(x_permuted, self.w1, topology)
         x_permuted = relu_squared(x_permuted)
@@ -284,14 +284,14 @@ class MoEMLP(nn.Module):
         # avoids a full (tokens, num_experts) @ (num_experts,) matmul + reduction.
         p_i = router_probs.mean(dim=0)
         load_balance_loss = self._compute_load_balance_loss(
-            p_i, selected_experts_flat, f_i
+            p_i, selected_experts_flat, f_i,
         )
         compute_loss = p_i @ self.expert_widths_normalized.to(p_i.dtype)
         dropped_routes = torch.clamp(
-            tokens_per_expert - block_tokens_per_expert, min=0
+            tokens_per_expert - block_tokens_per_expert, min=0,
         ).sum()
         padding_routes = torch.clamp(
-            block_tokens_per_expert - tokens_per_expert, min=0
+            block_tokens_per_expert - tokens_per_expert, min=0,
         ).sum()
         num_routes = selected_experts_flat.numel()
 
@@ -322,10 +322,10 @@ class MoEMLP(nn.Module):
         # bits is ample for deciding which routes occupy the final 128-row block and
         # avoids two large stable sorts.
         route_keys = ops.pack_route_keys(
-            selected_experts_flat, route_scores_flat, self.route_score_bits
+            selected_experts_flat, route_scores_flat, self.route_score_bits,
         )
         sorted_keys, indices = ops.sort(
-            route_keys, self.sort_end_bit + self.route_score_bits
+            route_keys, self.sort_end_bit + self.route_score_bits,
         )
         bin_ids = (sorted_keys >> self.route_score_bits).int()
         return bin_ids, indices, tokens_per_expert
@@ -354,7 +354,7 @@ class MoEMLP(nn.Module):
         if last_padded == 0:
             raise ValueError(
                 "nearest token rounding removed every route; increase the "
-                "microbatch size or use token_rounding='ceil'"
+                "microbatch size or use token_rounding='ceil'",
             )
         padded_tokens = max(last_padded, self.block_size)
         # Number of real row-blocks == sum(expert_token_blocks).
@@ -427,7 +427,7 @@ class MoEMLP(nn.Module):
         return padded_bins, topology, last_padded
 
     def _gather_tokens(
-        self, x, indices, bin_ids, bins, padded_bins, padded_tokens
+        self, x, indices, bin_ids, bins, padded_bins, padded_tokens,
     ):
         return ops.padded_gather(
             x,
@@ -441,7 +441,7 @@ class MoEMLP(nn.Module):
 
     def _scatter_tokens(self, x, indices, bin_ids, weights, bins, padded_bins):
         return ops.padded_scatter(
-            x, indices, bin_ids, weights, bins, padded_bins, self.num_active_experts
+            x, indices, bin_ids, weights, bins, padded_bins, self.num_active_experts,
         )
 
     def _compute_load_balance_loss(self, p_i, experts_flat, f_i):
@@ -494,9 +494,9 @@ class GPT(nn.Module):
             {
                 "wte": nn.Embedding(config.vocab_size, config.n_embd),
                 "h": nn.ModuleList(
-                    [Block(config, layer_idx) for layer_idx in range(config.n_layer)]
+                    [Block(config, layer_idx) for layer_idx in range(config.n_layer)],
                 ),
-            }
+            },
         )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.rotary_seq_len = config.sequence_len * 10

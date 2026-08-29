@@ -444,7 +444,7 @@ def padded_scatter(x, indices, bin_ids, weights, bins, padded_bins, top_k):
         # the 8x (top_k) intermediate. Accumulating in fp32 is also slightly more
         # accurate than summing the bf16 intermediate the old path produced.
         route_rows = torch.empty(
-            indices.shape[0], device=indices.device, dtype=torch.int32
+            indices.shape[0], device=indices.device, dtype=torch.int32,
         )
         _build_route_rows[(triton.cdiv(indices.shape[0], 256),)](
             route_rows,
