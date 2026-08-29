@@ -22,8 +22,8 @@ Forward reuses fused_moe's counting-sort routing verbatim, then:
   `_proj_rows`      x @ W for one projection, gathering x rows on the fly;
                     called twice (gate, up), storing the pre-activations
                     (backward needs them -- the stk path stores the same two)
-  h = silu(g) * u   one elementwise pass (transient, freed after the forward)
-  `_down_proj`      fused_moe's serving kernel on h
+  h = silu(g) * u   fused into the up projection's output epilogue
+  `_down_proj`      Triton or optional CuTe grouped GEMM on h
   `_scatter_reduce` weighted top-k reduction into the output (from kernels.py)
 
 Backward, all deterministic (fp32 accumulators, fixed reduction order, no
@@ -31,9 +31,10 @@ atomics):
 
   `_route_bwd`      dy_rows[row] = w_r * dout[token]; dw_r = <y_row, dout>
   `_dgu`            dh = dy_rows @ Wd^T, then SwiGLU' in-register -> dg, du
-  `_wgrad_rows`     dW = rows^T @ cols for (h, dy_rows) -> dWd
+  `_wgrad_rows`     Triton or CuTe rows^T @ cols for (h, dy_rows) -> dWd
   `_wgrad_gather`   dW = gather(x)^T @ dg -> dWg, and with du -> dWu
-  `_dx_rows`        dx_rows = dg @ Wg^T + du @ Wu^T
+  `_dx_rows_fused`  dx_rows = dg @ Wg^T + du @ Wu^T, using one fp32
+                    accumulator in either Triton or CuTe
   `_scatter_reduce` (unweighted) top-k sum of dx_rows into dx
 
 Padding is self-consistent everywhere: a padding row inside a claimed tile has
@@ -61,17 +62,17 @@ from megablocks.backend.fused_moe import (
 # stages). BLOCK_N on the width axis must be a multiple of 128 (the
 # width-block granularity); on the hidden axis it must divide the hidden size.
 _CFG = {
-    'proj': (128, 128, 32, 4, 3),        # _proj_rows (gate and up)
+    'proj': (128, 128, 16, 4, 2),        # gate projection
+    'proj_fused': (128, 128, 32, 4, 2),  # up projection + SwiGLU epilogue
     'down': (128, 256, 64, 8, 3),        # _down_proj on h
     'dgu': (128, 128, 64, 8, 3),         # _dgu
-    'dx': (128, 128, 64, 8, 3),          # _dx_rows
+    'dx_fused': (128, 256, 32, 8, 2),    # gate + up input-gradient streams
     'wgrad_down': (64, 128, 32, 4, 2),   # _wgrad_rows: (BLOCK_W, BLOCK_H, K)
-    'wgrad_gateup': (128, 128, 64, 4, 3),  # _wgrad_gather: (BLOCK_W, BLOCK_H, K)
+    'wgrad_gateup': (128, 64, 32, 4, 2),  # _wgrad_gather: (BLOCK_W, BLOCK_H, K)
 }
 # The row-tile layout is planned once with this block; every row-tile kernel
 # uses the same BLOCK_M so tiles stay aligned to the planned buffers.
 _ROW_BLOCK = 128
-
 
 # One projection over gathered rows: out[row, :w_e] = x[tok(row)] @ W_e.
 # Padding rows load x as zero, so they produce exact zeros.
@@ -80,6 +81,8 @@ def _proj_rows(
     x,
     w,
     out,
+    g_in,
+    h_out,
     route_tokens,
     tile_expert,
     expert_col_off,
@@ -91,6 +94,7 @@ def _proj_rows(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    FUSE_SILU: tl.constexpr,
 ):
     mt = tl.program_id(0)
     nt = tl.program_id(1)
@@ -114,8 +118,16 @@ def _proj_rows(
         a = tl.load(xp + kk[None, :], mask=valid[:, None], other=0.0)
         acc += tl.dot(a, tl.load(w + kk[:, None] * TOTAL_W + col[None, :]))
 
-    tl.store(out + rows[:, None] * MAX_W + local[None, :],
-             acc.to(out.dtype.element_ty))
+    dst = rows[:, None] * MAX_W + local[None, :]
+    out_value = acc.to(out.dtype.element_ty)
+    tl.store(out + dst, out_value)
+    if FUSE_SILU:
+        # Preserve the old numerics: the standalone kernel consumed the bf16
+        # value after the projection store, not the fp32 accumulator.
+        gg = tl.load(g_in + dst).to(tl.float32)
+        uu = out_value.to(tl.float32)
+        tl.store(h_out + dst,
+                 (gg * tl.sigmoid(gg) * uu).to(h_out.dtype.element_ty))
 
 
 # One program per route. Splits dout at the reduction boundary: the row grad
@@ -302,15 +314,15 @@ def _wgrad_gather(
              acc.to(dw.dtype.element_ty))
 
 
-# One term of dx_rows = dg @ Wg^T + du @ Wu^T over the expert's own width;
-# launched twice, the second launch accumulating onto the first (ACCUM).
-# Splitting the two weight streams lets each launch run a clean single-stream
-# GEMM; the top-k sum back into token space is kernels._scatter_reduce with
-# SCALE=False. W rows are loaded contiguously as (H, K), transposed in-register.
+# Single-launch form of the two input-gradient GEMMs. It retains one fp32
+# accumulator and streams gate then up operands through it, avoiding an
+# intermediate bf16 dx write/read.
 @triton.jit
-def _dx_rows(
-    d_in,
-    w,
+def _dx_rows_fused(
+    dg,
+    du,
+    wg,
+    wu,
     dx,
     tile_expert,
     expert_col_off,
@@ -322,7 +334,6 @@ def _dx_rows(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    ACCUM: tl.constexpr,
 ):
     mt = tl.program_id(0)
     nt = tl.program_id(1)
@@ -334,18 +345,22 @@ def _dx_rows(
     coff = tl.load(expert_col_off + e)
     rows = mt * BLOCK_M + tl.arange(0, BLOCK_M)
     hcol = nt * BLOCK_N + tl.arange(0, BLOCK_N)
-
     base = rows[:, None] * MAX_W
+
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k in range(0, width, BLOCK_K):
         kk = k + tl.arange(0, BLOCK_K)
-        a = tl.load(d_in + base + kk[None, :])
         wsrc = hcol[:, None] * TOTAL_W + (coff + kk)[None, :]
-        acc += tl.dot(a, tl.trans(tl.load(w + wsrc)))
+        acc += tl.dot(
+            tl.load(dg + base + kk[None, :]),
+            tl.trans(tl.load(wg + wsrc)),
+        )
+        acc += tl.dot(
+            tl.load(du + base + kk[None, :]),
+            tl.trans(tl.load(wu + wsrc)),
+        )
 
     dst = dx + rows[:, None] * HIDDEN + hcol[None, :]
-    if ACCUM:
-        acc += tl.load(dst).to(tl.float32)
     tl.store(dst, acc.to(dx.dtype.element_ty))
 
 
@@ -412,7 +427,19 @@ def _wb_expert_table(plan, block_w):
 class _GroupedMoE(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, x, top_weights, expert_ids, w_gate, w_up, w_down, plan, top_k):
+    def forward(
+        ctx,
+        x,
+        top_weights,
+        expert_ids,
+        w_gate,
+        w_up,
+        w_down,
+        plan,
+        top_k,
+        down_proj_backend,
+        recompute_activation,
+    ):
         num_tokens, hidden = x.shape
         num_routes = num_tokens * top_k
         if hidden != plan.hidden_size:
@@ -421,6 +448,13 @@ class _GroupedMoE(torch.autograd.Function):
             raise ValueError(
                 f'expected {num_routes} expert ids, got {expert_ids.numel()}',
             )
+        if down_proj_backend not in ('triton', 'cute'):
+            raise ValueError(
+                "down_proj_backend must be 'triton' or 'cute', got "
+                f'{down_proj_backend!r}',
+            )
+        if not isinstance(recompute_activation, bool):
+            raise TypeError('recompute_activation must be a bool')
 
         bn = plan.block_n
         bm = _ROW_BLOCK
@@ -470,15 +504,23 @@ class _GroupedMoE(torch.autograd.Function):
         counts = plan.counts.clone()
         row_start = plan.expert_row_start.clone()
 
-        pm, pn, pk, pw, ps = _CFG['proj']
         g = torch.empty((row_bound, plan.max_width), dtype=x.dtype, device=dev)
         u = torch.empty((row_bound, plan.max_width), dtype=x.dtype, device=dev)
-        proj_grid = (m_tiles, (plan.max_width + pn - 1) // pn)
-        for w, out in ((w_gate, g), (w_up, u)):
+        h = torch.empty_like(g)
+        for w, out, fuse_silu in (
+            (w_gate, g, False),
+            (w_up, u, True),
+        ):
+            pm, pn, pk, pw, ps = _CFG[
+                'proj_fused' if fuse_silu else 'proj'
+            ]
+            proj_grid = (m_tiles, (plan.max_width + pn - 1) // pn)
             _proj_rows[proj_grid](
                 x,
                 w,
                 out,
+                g,
+                h,
                 route_tokens,
                 tile_expert,
                 plan.expert_col_off,
@@ -490,33 +532,48 @@ class _GroupedMoE(torch.autograd.Function):
                 BLOCK_M=pm,
                 BLOCK_N=pn,
                 BLOCK_K=pk,
+                FUSE_SILU=fuse_silu,
                 num_warps=pw,
                 num_stages=ps,
             )
 
-        # Transient: freed after the down projection; backward recomputes it.
-        h = _silu_mul_launch(g, u)
-
         dm, dn, dk, dw_, ds = _CFG['down']
         dn = min(dn, hidden)
         y = torch.empty((row_bound, hidden), dtype=x.dtype, device=dev)
-        _down_proj[(m_tiles, hidden // dn)](
-            h,
-            w_down,
-            y,
-            tile_expert,
-            plan.expert_col_off,
-            plan.expert_nblocks,
-            HIDDEN=hidden,
-            MAX_W=plan.max_width,
-            WIDTH_BLOCK=bn,
-            BLOCK_M=dm,
-            BLOCK_N=dn,
-            BLOCK_K=dk,
-            num_warps=dw_,
-            num_stages=ds,
-        )
-        del h
+        if down_proj_backend == 'cute':
+            # Lazy import keeps CUTLASS DSL entirely optional for the default
+            # Triton path (and avoids its import cost during normal startup).
+            from megablocks.backend.cute_down_proj import cute_down_proj
+
+            cute_down_proj(
+                h,
+                w_down,
+                y,
+                tile_expert,
+                plan.expert_col_off,
+                plan.expert_nblocks,
+                bn,
+            )
+        elif down_proj_backend == 'triton':
+            _down_proj[(m_tiles, hidden // dn)](
+                h,
+                w_down,
+                y,
+                tile_expert,
+                plan.expert_col_off,
+                plan.expert_nblocks,
+                HIDDEN=hidden,
+                MAX_W=plan.max_width,
+                WIDTH_BLOCK=bn,
+                BLOCK_M=dm,
+                BLOCK_N=dn,
+                BLOCK_K=dk,
+                num_warps=dw_,
+                num_stages=ds,
+            )
+        saved_h = None if recompute_activation else h
+        if recompute_activation:
+            del h
 
         out = torch.empty((num_tokens, hidden), dtype=x.dtype, device=dev)
         kernels._scatter_reduce[(num_tokens,)](
@@ -529,19 +586,24 @@ class _GroupedMoE(torch.autograd.Function):
             SCALE=True,
         )
 
-        ctx.save_for_backward(x, top_weights, w_gate, w_up, w_down,
-                              route_tokens, route_rows, tile_expert,
-                              counts, row_start, g, u, y)
+        saved = (x, top_weights, w_gate, w_up, w_down,
+                 route_tokens, route_rows, tile_expert,
+                 counts, row_start, g, u, y)
+        if saved_h is not None:
+            saved += (saved_h,)
+        ctx.save_for_backward(*saved)
         ctx.plan = plan
         ctx.top_k = top_k
         ctx.launch = (bm, m_tiles, row_bound)
+        ctx.down_proj_backend = down_proj_backend
+        ctx.recompute_activation = recompute_activation
         return out
 
     @staticmethod
     def backward(ctx, dout):
         (x, top_weights, w_gate, w_up, w_down,
          route_tokens, route_rows, tile_expert,
-         counts, row_start, g, u, y) = ctx.saved_tensors
+         counts, row_start, g, u, y) = ctx.saved_tensors[:13]
         plan, top_k = ctx.plan, ctx.top_k
         bm, m_tiles, row_bound = ctx.launch
         num_tokens, hidden = x.shape
@@ -600,26 +662,44 @@ class _GroupedMoE(torch.autograd.Function):
 
         # One elementwise pass beats recomputing silu(g)*u inside every K
         # iteration of the weight-gradient kernel. Transient; freed after.
-        h = _silu_mul_launch(g, u)
+        h = (
+            _silu_mul_launch(g, u)
+            if ctx.recompute_activation
+            else ctx.saved_tensors[13]
+        )
         ww, wh, wk, wwar, wst = _CFG['wgrad_down']
         dwd = torch.empty_like(w_down)
-        _wgrad_rows[(plan.total_width // ww, hidden // wh)](
-            h,
-            dy_rows,
-            dwd,
-            _wb_expert_table(plan, ww),
-            plan.expert_col_off,
-            row_start,
-            counts,
-            bm,
-            HIDDEN=hidden,
-            MAX_W=plan.max_width,
-            BLOCK_W=ww,
-            BLOCK_H=wh,
-            BLOCK_K=wk,
-            num_warps=wwar,
-            num_stages=wst,
-        )
+        if ctx.down_proj_backend == 'cute':
+            from megablocks.backend.cute_down_proj import cute_wgrad_rows
+
+            cute_wgrad_rows(
+                h,
+                dy_rows,
+                dwd,
+                _wb_expert_table(plan, 128),
+                plan.expert_col_off,
+                counts,
+                row_start,
+                bm,
+            )
+        else:
+            _wgrad_rows[(plan.total_width // ww, hidden // wh)](
+                h,
+                dy_rows,
+                dwd,
+                _wb_expert_table(plan, ww),
+                plan.expert_col_off,
+                row_start,
+                counts,
+                bm,
+                HIDDEN=hidden,
+                MAX_W=plan.max_width,
+                BLOCK_W=ww,
+                BLOCK_H=wh,
+                BLOCK_K=wk,
+                num_warps=wwar,
+                num_stages=wst,
+            )
         del h
 
         ww, wh, wk, wwar, wst = _CFG['wgrad_gateup']
@@ -647,13 +727,29 @@ class _GroupedMoE(torch.autograd.Function):
                 num_stages=wst,
             )
 
-        xm, xn, xk, xw, xs = _CFG['dx']
-        xn = min(xn, hidden)
         dx_rows = torch.empty((row_bound, hidden), dtype=x.dtype, device=dev)
-        for accum, (d_rows, w) in enumerate(((dg, w_gate), (du, w_up))):
-            _dx_rows[(m_tiles, hidden // xn)](
-                d_rows,
-                w,
+        if ctx.down_proj_backend == 'cute':
+            from megablocks.backend.cute_down_proj import cute_dx_proj_fused
+
+            cute_dx_proj_fused(
+                dg,
+                du,
+                w_gate,
+                w_up,
+                dx_rows,
+                tile_expert,
+                plan.expert_col_off,
+                plan.expert_nblocks,
+                bn,
+            )
+        else:
+            xm, xn, xk, xw, xs = _CFG['dx_fused']
+            xn = min(xn, hidden)
+            _dx_rows_fused[(m_tiles, hidden // xn)](
+                dg,
+                du,
+                w_gate,
+                w_up,
                 dx_rows,
                 tile_expert,
                 plan.expert_col_off,
@@ -665,11 +761,9 @@ class _GroupedMoE(torch.autograd.Function):
                 BLOCK_M=xm,
                 BLOCK_N=xn,
                 BLOCK_K=xk,
-                ACCUM=bool(accum),
                 num_warps=xw,
                 num_stages=xs,
             )
-
         dx = torch.empty_like(x)
         kernels._scatter_reduce[(num_tokens,)](
             dx,
@@ -682,17 +776,33 @@ class _GroupedMoE(torch.autograd.Function):
         )
 
         return (dx, dw_routes.to(top_weights.dtype), None,
-                dwg, dwu, dwd, None, None)
+                dwg, dwu, dwd, None, None, None, None)
 
 
-def grouped_moe(x, top_weights, expert_ids, plan, top_k, w_gate, w_up, w_down):
+def grouped_moe(
+    x,
+    top_weights,
+    expert_ids,
+    plan,
+    top_k,
+    w_gate,
+    w_up,
+    w_down,
+    down_proj_backend='triton',
+    recompute_activation=True,
+):
     """Differentiable gated MoE over packed variable-width experts.
 
     Same calling convention as fused_moe_forward: `expert_ids` and
     `top_weights` are the flattened (tokens * top_k) routed expert ids (int32)
     and routing weights, token-major, straight from topk. Returns
     (tokens, hidden), differentiable w.r.t. x, top_weights and all three
-    weights.
+    weights. ``down_proj_backend='cute'`` opts into the experimental Ampere
+    CuTe DSL down projection, input gradients, and down-projection weight
+    gradient. The remaining kernels use Triton. Set
+    ``recompute_activation=False`` to retain the forward SwiGLU activation and
+    trade activation memory for a faster backward pass.
     """
     return _GroupedMoE.apply(x, top_weights, expert_ids,
-                             w_gate, w_up, w_down, plan, top_k)
+                             w_gate, w_up, w_down, plan, top_k,
+                             down_proj_backend, recompute_activation)

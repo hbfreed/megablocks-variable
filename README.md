@@ -37,6 +37,16 @@ training MoEs with MegaBlocks + Megatron-LM.
 
 Installing `megablocks[gg]` enables dMoE computation with grouped GEMM. This feature is enabled by setting the `mlp_impl` argument to `grouped`. This is currently our recommended path for Hopper-generation GPUs.
 
+Installing `megablocks[cute]` enables the experimental CuTe DSL GEMM suite for
+the variable-width grouped training backend. It accelerates the down
+projection, input gradient, and down-projection weight gradient; the remaining
+kernels use Triton. It currently targets BF16 on Ampere (compute capability
+8.x) and is selected explicitly with
+`grouped_moe(..., down_proj_backend="cute")`; Triton remains the default.
+For maximum training speed, `recompute_activation=False` retains the forward
+SwiGLU activation for backward; the default recomputes it to reduce saved
+activation memory.
+
 Installing `megablocks[dev]` allows you to contribute to MegaBlocks and test
 locally. If you've installed `megablocks[dev]`, you can run `pre-commit
 install` to configure the pre-commit hook to automatically format the code.

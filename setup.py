@@ -71,6 +71,11 @@ extra_deps['gg'] = [
     'grouped_gemm==0.3.0',
 ]
 
+extra_deps['cute'] = [
+    'nvidia-cutlass-dsl>=4.6.0,<4.7',
+    'apache-tvm-ffi>=0.1.0,<0.2',
+]
+
 extra_deps['dev'] = [
     'absl-py',  # TODO: delete when finish removing all absl tests
     'coverage[toml]==7.4.4',

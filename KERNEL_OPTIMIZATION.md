@@ -242,3 +242,117 @@ own sake; it becomes interesting again only with TMA/warp-specialization
 
 Both variants passed the full `fused_moe_test.py` matrix (25 cases) before
 being reverted; correctness was not the problem.
+
+## CuTe DSL Ampere training GEMMs (2026-08-28)
+
+The grouped training backend is already pure Triton, so CuTe DSL was first
+tested on one self-contained hot GEMM before considering a wider rewrite. The
+initial candidate replaced `_down_proj` and consumed the same device-side
+ragged plan. One launch covers every expert row tile; expert widths remain
+runtime values and no routing metadata is copied to the host.
+
+The stock CuTe Ampere tile (128x128x32, four stages) was slower than the tuned
+Triton kernel: about 1.65 ms versus 1.53 ms. A 128x256x32 CTA with an
+`(1, 8, 1)` MMA atom layout and three pipeline stages reversed the result. A
+later interleaved cross-shape sweep refined the atom layout to `(2, 4, 1)` for
+a further small improvement. On the keep50 width tables at 4096 tokens, hidden
+size 2048, and top-k 8:
+
+| routing pattern | Triton | CuTe | CuTe / Triton |
+|---|---:|---:|---:|
+| uniform, four sampled layers | 1.52-1.79 ms | 1.50-1.76 ms | 0.982-0.986 |
+| concentrated on eight widest experts | 2.20-2.30 ms | 2.14-2.24 ms | 0.972-0.977 |
+| concentrated on eight narrowest experts | 0.50-0.80 ms | 0.48-0.77 ms | 0.954-0.972 |
+
+The BF16 outputs were bit-identical to Triton. The complete grouped forward was
+also bit-identical and improved by roughly 0.5-2% (5.04 ms versus 5.07 ms at
+the median of six paired runs). Dynamic row and expert dimensions let a small
+compile cache serve all 16 layer layouts; distinct maximum-width variants
+compile separately. TVM-FFI accepts PyTorch tensors directly, reducing
+measured host launch overhead from the initial DLPack prototype's roughly 84
+microseconds to roughly 9 microseconds.
+
+The same pipeline was then extended to the backward input projection and the
+down-projection weight gradient. The retained training changes are:
+
+- Fuse the up projection's SwiGLU epilogue in Triton: 1.781 ms for projection
+  plus activation became 1.541 ms (13.5% faster).
+- Combine the two Triton input-gradient streams into one accumulator as the
+  dependency-free fallback: 4.334 ms became 3.683 ms (15.0% faster).
+- For the CuTe backend, stream the gate and up input-gradient operands through
+  one 128x256x32 kernel and one fp32 accumulator. This writes one bf16 row
+  buffer and uses the normal scatter, rather than launching two kernels and
+  adding a second buffer inside the scatter. The fused kernel measured about
+  2.95 ms; the former pair measured about 3.05 ms before its wider scatter.
+- Compute `dW_down` with a 128x256x64 CuTe tile, two pipeline stages, and a
+  `(2, 4, 1)` atom layout. The isolated keep50 kernel measured about 1.49 ms
+  versus 1.85-1.94 ms in Triton, and was bit-identical. The final K64 tile was
+  another roughly 0.01 ms faster than the original K32 CuTe version.
+- Retune the gate projection independently from the fused up+SwiGLU projection.
+  Gate uses a 128x128x16, four-warp, two-stage tile; up retains
+  128x128x32. The gate kernel dropped by about 0.05 ms.
+
+The final native tuning pass swept the important kernels over the real width
+tables rather than optimizing only layer 0. In particular, 120 candidate
+configurations for each gate/up weight-gradient GEMM were checked, then the
+leaders were interleaved across layers 0, 3, 7, 10, and 15 under uniform,
+widest-expert, and narrowest-expert routing. The retained 128x64x32,
+four-warp, two-stage tile reduced a complete Triton step by a paired median
+0.157 ms and a complete CuTe step by 0.235 ms. An equivalent `_dgu` search
+confirmed its existing 128x128x64 tile. Sweeps of the small route, scatter,
+padding-zero, and count reductions found only microsecond-scale noise, so their
+launches were left unchanged.
+
+On the layer-0 math keep50 table (54 live experts, total width 32768), 4096
+tokens, hidden size 2048, and top-k 8, the final locked Torch 2.12.1 / CUDA
+12.6 / CUTLASS DSL 4.6.3 stack measured:
+
+| training path | step | forward | backward |
+|---|---:|---:|---:|
+| optimized Triton | 16.491 ms | 5.197 ms | 11.265 ms |
+| CuTe, recompute activation | 15.626 ms | 5.133 ms | 10.491 ms |
+| CuTe, retain activation | **15.264 ms** | **5.110 ms** | **10.126 ms** |
+
+These are medians from 150 rotated runs. CuTe with the default activation
+recompute won all 150 paired comparisons against Triton, with a median paired
+advantage of 0.906 ms (5.5%). Passing `recompute_activation=False` won all 150
+against Triton and 143/150 against recompute, improving the paired median by a
+further 0.309 ms and by 1.165 ms (7.1%) over Triton. It retains another 77.5
+MiB at this one-layer shape; across
+16 simultaneously saved layer activations that is roughly 1.2 GiB. The
+pre-change Triton step measured about 16.97 ms in the same development session,
+so the fastest retained path is roughly 10% faster overall, though that
+before/after figure was not paired.
+
+Several plausible fusions were measured and reverted:
+
+- Writing a recomputed forward activation from `_dgu` made the combined
+  backward activation stage 4.7% slower (2.146 versus 2.049 ms). Retaining the
+  already-computed forward activation is faster, but deliberately remains an
+  explicit memory/speed option.
+- CuTe's raw `dY @ W_down.T` core beat Triton (1.527 versus 1.72 ms), but its
+  fused SwiGLU-derivative epilogue raised the kernel to 2.45 ms.
+- Fusing gate/up weight gradients in Triton was 5.4% slower (3.231 versus
+  3.065 ms). Pre-gathering `x` for two CuTe weight gradients was also slower in
+  the full step by 0.107 ms and lost 97 of 100 paired samples.
+- Forward routing itself was only about 25 microseconds, too small to justify a
+  routing/projection megakernel with extra synchronization and register state.
+
+Helion 1.4 was also piloted as an autotuning front end for the gate projection.
+The first high-level formulation accidentally serialized width tiles and took
+2.93 ms after quick tuning. Expressing expert-row and width tiles as the outer
+grid and preserving the runtime width early-exit brought it close: a quick
+72-second search covered 33 configurations and selected a kernel that measured
+1.56 ms versus 1.47 ms for the handwritten Triton projection. A seeded
+three-minute full search tried 40 configurations (10 compile failures) and
+retained the same shape at 1.55 ms. Helion's autotuning interface is
+convenient, but it
+tunes kernels generated from Helion source rather than existing Triton or CuTe
+kernels; the small remaining loss and extra dependency did not justify a
+production rewrite. See the [Helion project](https://github.com/pytorch/helion)
+and its [deployment/autotuning guide](https://helionlang.com/deployment_autotuning.html).
+
+The backend remains opt-in because CUTLASS DSL is a large optional dependency
+and the implementation currently supports only BF16 Ampere with hidden sizes
+divisible by 256. Install `megablocks[cute]` and pass
+`down_proj_backend="cute"` to `grouped_moe`; Triton remains the default.
