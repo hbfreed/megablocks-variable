@@ -7,7 +7,8 @@ are the same bf16 tensors the kernels see, the reference math runs in fp32,
 and every gradient (x, routing weights, all three expert weights) must agree
 with the kernel gradients to bf16 tolerance. Training must also be bitwise
 reproducible: the routing layout is checked exactly, and repeated identical
-steps must produce identical outputs and gradients.
+steps must produce identical outputs and gradients. Nearest token rounding is
+checked against the same reference restricted to the routes it keeps.
 """
 
 import importlib.util
@@ -34,7 +35,7 @@ _CASES = [
 _GRAD_NAMES = ('dx', 'dw_route', 'dwg', 'dwu', 'dwd')
 
 
-def _reference(x, top_w, top_e, w_gate, w_up, w_down, widths):
+def _reference(x, top_w, top_e, w_gate, w_up, w_down, widths, keep=None):
     offsets = [0]
     for w in widths:
         offsets.append(offsets[-1] + w)
@@ -42,7 +43,8 @@ def _reference(x, top_w, top_e, w_gate, w_up, w_down, widths):
     xf = x.float()
     for e in range(len(widths)):
         lo, hi = offsets[e], offsets[e + 1]
-        rows, slots = torch.where(top_e == e)
+        routed = top_e == e if keep is None else (top_e == e) & keep
+        rows, slots = torch.where(routed)
         if rows.numel() == 0:
             continue
         xi = xf[rows]
@@ -58,7 +60,37 @@ def _rel(a, b):
     return (a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-30)
 
 
-def _inputs(widths, hidden, top_k, num_tokens, seed=0, zero_last_weight=False):
+def _nearest_rounding(top_e, scores, num_experts):
+    """(keep, rank) under nearest token rounding, by the kernels' own rule.
+
+    Keys are expert-major with descending quantized score, as in
+    kernels._pack_route_keys; a stable sort ranks each expert's routes, and an
+    expert keeps min(count, count rounded half up to the row tile) of them.
+    """
+    block = grouped_moe_module._ROW_BLOCK
+    bits = grouped_moe_module._route_score_bits(num_experts)
+    scale = (1 << bits) - 1
+    e = top_e.flatten().long().cpu()
+    descending = ((1.0 - scores.flatten().float().cpu()) * scale).to(torch.int32)
+    keys = (e << bits) | descending.clamp(0, scale).long()
+    order = torch.sort(keys, stable=True).indices
+    counts = torch.bincount(e, minlength=num_experts)
+    kept = torch.minimum(counts, (counts + block // 2) // block * block)
+    start = torch.cumsum(counts, 0) - counts
+    rank = torch.empty_like(e)
+    rank[order] = torch.arange(e.numel()) - start[e[order]]
+    return (rank < kept[e]).view(top_e.shape), rank.view(top_e.shape)
+
+
+def _inputs(
+    widths,
+    hidden,
+    top_k,
+    num_tokens,
+    seed=0,
+    zero_last_weight=False,
+    renormalize=False,
+):
     torch.manual_seed(seed)
     dev = torch.device('cuda')
     total = sum(widths)
@@ -76,19 +108,31 @@ def _inputs(widths, hidden, top_k, num_tokens, seed=0, zero_last_weight=False):
     top_w0, top_e = torch.topk(F.softmax(logits, dim=1, dtype=torch.float), top_k, -1)
     if zero_last_weight:
         top_w0[:, -1] = 0.0
+    # The router probabilities rank routes for token rounding; renormalizing
+    # the weights, as gpt_model.MoEMLP does, makes the two orders differ.
+    scores = top_w0
+    if renormalize:
+        top_w0 = top_w0 / top_w0.sum(dim=-1, keepdim=True)
     top_w = top_w0.to(torch.bfloat16).requires_grad_()
 
     dout = torch.randn(num_tokens, hidden, device=dev, dtype=torch.bfloat16)
     plan = FusedMoEPlan(widths, hidden, dev)
-    return x, top_w, top_e, w_gate, w_up, w_down, dout, plan
+    return x, top_w, top_e, w_gate, w_up, w_down, dout, plan, scores
 
 
-def _step(inputs, top_k, down_proj_backend='triton', recompute_activation=True):
+def _step(
+    inputs,
+    top_k,
+    down_proj_backend='triton',
+    recompute_activation=True,
+    token_rounding='ceil',
+):
     """One forward + backward; returns (out, grads) and clears the leaf grads."""
-    x, top_w, top_e, w_gate, w_up, w_down, dout, plan = inputs
+    x, top_w, top_e, w_gate, w_up, w_down, dout, plan, scores = inputs
     out = grouped_moe(x, top_w.flatten(), top_e.flatten().int(), plan,
                       top_k, w_gate, w_up, w_down, down_proj_backend,
-                      recompute_activation)
+                      recompute_activation, token_rounding,
+                      scores.flatten() if token_rounding == 'nearest' else None)
     out.backward(dout)
     leaves = (x, top_w, w_gate, w_up, w_down)
     grads = [t.grad for t in leaves]
@@ -106,12 +150,19 @@ def _run(
     down_proj_backend='triton',
     recompute_activation=True,
     zero_last_weight=False,
+    token_rounding='ceil',
 ):
-    inputs = _inputs(widths, hidden, top_k, num_tokens, seed, zero_last_weight)
-    got, grads = _step(inputs, top_k, down_proj_backend, recompute_activation)
+    inputs = _inputs(widths, hidden, top_k, num_tokens, seed, zero_last_weight,
+                     renormalize=token_rounding == 'nearest')
+    got, grads = _step(inputs, top_k, down_proj_backend, recompute_activation,
+                       token_rounding)
 
-    x, top_w, top_e, w_gate, w_up, w_down, dout, _ = inputs
-    want = _reference(x, top_w, top_e, w_gate, w_up, w_down, widths)
+    x, top_w, top_e, w_gate, w_up, w_down, dout, _, scores = inputs
+    keep = None
+    if token_rounding == 'nearest':
+        keep, _ = _nearest_rounding(top_e, scores, len(widths))
+        keep = keep.to(top_e.device)
+    want = _reference(x, top_w, top_e, w_gate, w_up, w_down, widths, keep)
     want.backward(dout.float())
     ref_grads = [t.grad for t in (x, top_w, w_gate, w_up, w_down)]
 
@@ -188,7 +239,36 @@ def test_cute_backend_matches_dense_autograd_reference(
 @pytest.mark.gpu
 @pytest.mark.world_size(1)
 @pytest.mark.parametrize('down_proj_backend', ['triton', 'cute'])
-def test_training_step_is_bitwise_reproducible(down_proj_backend):
+@pytest.mark.parametrize(
+    'widths, hidden, top_k, num_tokens',
+    [
+        ([128] * 8, 256, 2, 700),                     # ~175 routes per expert
+        ([128, 256, 384, 512] * 16, 1024, 6, 1500),   # ~140 routes per expert
+    ],
+)
+def test_nearest_token_rounding_matches_reference(
+    widths,
+    hidden,
+    top_k,
+    num_tokens,
+    down_proj_backend,
+):
+    # The reference drops the same routes and runs the dense expert loop over
+    # the rest; dropped routes must get zero routing-weight gradient.
+    if down_proj_backend == 'cute':
+        _require_cute()
+    _assert_close(_run(widths, hidden, top_k, num_tokens,
+                       down_proj_backend=down_proj_backend,
+                       token_rounding='nearest'))
+
+
+@pytest.mark.gpu
+@pytest.mark.world_size(1)
+@pytest.mark.parametrize(
+    'down_proj_backend, token_rounding',
+    [('triton', 'ceil'), ('cute', 'ceil'), ('triton', 'nearest')],
+)
+def test_training_step_is_bitwise_reproducible(down_proj_backend, token_rounding):
     # 8192 routes span eight routing blocks, and every expert takes rows from
     # several of them, so any order-dependent row assignment shows up as
     # weight-gradient bit differences between identical steps. Retaining the
@@ -197,9 +277,11 @@ def test_training_step_is_bitwise_reproducible(down_proj_backend):
         _require_cute()
     top_k = 8
     inputs = _inputs([128, 256, 384, 512] * 16, 1024, top_k, 1024)
-    first_out, first_grads = _step(inputs, top_k, down_proj_backend)
+    first_out, first_grads = _step(inputs, top_k, down_proj_backend,
+                                   token_rounding=token_rounding)
     for recompute_activation in (True, True, False):
-        out, grads = _step(inputs, top_k, down_proj_backend, recompute_activation)
+        out, grads = _step(inputs, top_k, down_proj_backend,
+                           recompute_activation, token_rounding)
         assert torch.equal(out, first_out)
         for name, got, want in zip(_GRAD_NAMES, grads, first_grads):
             assert torch.equal(got, want), (
@@ -258,7 +340,7 @@ def test_forward_saves_no_hidden_wide_route_buffer():
     # from the intermediate, so the (rows, hidden) down-projection output is
     # not kept. Nothing hidden-wide may be saved besides the input leaves.
     hidden, top_k = 1024, 4
-    x, top_w, top_e, w_gate, w_up, w_down, _, plan = _inputs(
+    x, top_w, top_e, w_gate, w_up, w_down, _, plan, _ = _inputs(
         [128, 256] * 8, hidden, top_k, 300)
     out = grouped_moe(x, top_w.flatten(), top_e.flatten().int(), plan, top_k,
                       w_gate, w_up, w_down)
@@ -268,3 +350,46 @@ def test_forward_saves_no_hidden_wide_route_buffer():
         if t.data_ptr() not in leaves and t.dim() == 2 and t.shape[1] == hidden
     ]
     assert not wide, f'saved (rows, hidden) buffers: {wide}'
+
+
+@pytest.mark.gpu
+@pytest.mark.world_size(1)
+def test_nearest_rounding_layout():
+    # Exactly the expected routes are dropped (row -1); each expert's kept
+    # routes fill its rows in descending-score order; an expert that rounded
+    # down has no padding; padding rows carry token -1 and weight 0.
+    torch.manual_seed(0)
+    dev = torch.device('cuda')
+    widths, top_k, num_tokens = [128, 256, 384, 512] * 16, 6, 1500
+    plan = FusedMoEPlan(widths, 256, dev)
+    probs = F.softmax(torch.randn(num_tokens, len(widths), device=dev), dim=1)
+    scores, top_e = torch.topk(probs, top_k, -1)
+    weights = (scores / scores.sum(dim=-1, keepdim=True)).flatten().to(torch.bfloat16)
+    block = grouped_moe_module._ROW_BLOCK
+    m_tiles, row_bound = plan.bounds(num_tokens, top_k, block)
+    _, route_tokens, route_rows, row_w = grouped_moe_module._route(
+        top_e.flatten().int(), weights, plan, top_k, m_tiles, row_bound,
+        'nearest', scores.flatten())
+
+    keep, rank = _nearest_rounding(top_e, scores, len(widths))
+    keep, rank = keep.flatten(), rank.flatten()
+    e = top_e.flatten().long().cpu()
+    kept = torch.bincount(e[keep], minlength=len(widths))
+    counts = torch.bincount(e, minlength=len(widths))
+    assert bool((kept < counts).any()), 'no expert rounded down'
+    assert bool((kept % block != 0).any()), 'no expert rounded up'
+    tiles = (kept + block - 1) // block
+    start = (torch.cumsum(tiles, 0) - tiles) * block
+    routes = torch.arange(e.numel())
+    rows = route_rows.long().cpu()
+    assert torch.equal(rows < 0, ~keep)
+    assert torch.equal(rows[keep], (start[e] + rank)[keep])
+
+    route_tokens, row_w = route_tokens.cpu(), row_w.cpu()
+    assert torch.equal(route_tokens.long()[rows[keep]], routes[keep] // top_k)
+    assert torch.equal(row_w[rows[keep]], weights.float().cpu()[keep])
+    claimed = int(tiles.sum()) * block
+    padding = torch.ones(claimed, dtype=torch.bool)
+    padding[rows[keep]] = False
+    assert bool((route_tokens[:claimed][padding] == -1).all())
+    assert bool((row_w[:claimed][padding] == 0).all())
