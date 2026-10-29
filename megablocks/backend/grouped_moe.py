@@ -17,20 +17,31 @@ and the win from running every GEMM at its best single-tile config (128x128
 class) is larger than the cost of gathering x twice -- weight re-reads, not x
 re-reads, dominate the traffic at training shapes.
 
-Forward reuses fused_moe's counting-sort routing verbatim, then:
+Forward routes with a stable counting sort -- `_count_blocks`, fused_moe's
+`_plan_tiles`, then `_scatter_routes_stable`, which also puts each routing
+weight w_r on its route's padded row -- then:
 
   `_proj_rows`      x @ W for one projection, gathering x rows on the fly;
                     called twice (gate, up), storing the pre-activations
                     (backward needs them -- the stk path stores the same two)
-  h = silu(g) * u   fused into the up projection's output epilogue
+  h = w_r * silu(g) * u
+                    fused into the up projection's output epilogue
   `_down_proj`      Triton or optional CuTe grouped GEMM on h
-  `_scatter_reduce` weighted top-k reduction into the output (from kernels.py)
+  `_scatter_reduce` unweighted top-k sum into the output (from kernels.py)
+
+Folding the routing weight into h, as DeepGEMM's Mega MoE does, keeps the
+(rows, hidden) down-projection output out of the saved tensors: backward
+recovers dw_r from the intermediate instead, through the identity
+<y_row, dout> = <silu(g) * u, dout @ Wd^T>.
 
 Backward, all deterministic (fp32 accumulators, fixed reduction order, no
-atomics):
+atomics, and a row layout that is a pure function of the routing):
 
-  `_route_bwd`      dy_rows[row] = w_r * dout[token]; dw_r = <y_row, dout>
-  `_dgu`            dh = dy_rows @ Wd^T, then SwiGLU' in-register -> dg, du
+  `_route_bwd`      dy_rows[row] = dout[token]
+  `_dgu`            da = dy_rows @ Wd^T; per-tile partials of
+                    dw_r = <da, silu(g) * u>; dh = w_r * da, then SwiGLU'
+                    in-register -> dg, du
+  `_route_dw`       dw_r = sum of its row's partials, in tile order
   `_wgrad_rows`     Triton or CuTe rows^T @ cols for (h, dy_rows) -> dWd
   `_wgrad_gather`   dW = gather(x)^T @ dg -> dWg, and with du -> dWu
   `_dx_rows_fused`  dx_rows = dg @ Wg^T + du @ Wu^T, using one fp32
@@ -50,12 +61,7 @@ import triton
 import triton.language as tl
 
 from megablocks.backend import kernels
-from megablocks.backend.fused_moe import (
-    _count_experts,
-    _down_proj,
-    _plan_tiles,
-    _scatter_routes,
-)
+from megablocks.backend.fused_moe import _down_proj, _plan_tiles
 
 # Per-kernel launch configs, swept on a 3090 at the healing shape (keep50
 # widths, 4096 tokens, top_k 8). Keys: (BLOCK_M, BLOCK_N, BLOCK_K, warps,
@@ -74,6 +80,88 @@ _CFG = {
 # uses the same BLOCK_M so tiles stay aligned to the planned buffers.
 _ROW_BLOCK = 128
 
+# Routes per counting-sort block; _count_blocks and _scatter_routes_stable must
+# partition the routes identically.
+_ROUTE_BLOCK = 1024
+
+
+# Per-expert route counts for _plan_tiles, plus each block's own histogram for
+# _scatter_routes_stable. Integer atomics on the totals are order-independent,
+# so the counts are deterministic.
+@triton.jit
+def _count_blocks(
+    expert_ids,
+    counts,
+    block_hist,
+    num_routes,  # runtime, not constexpr -- see fused_moe._plan_tiles
+    NUM_EXPERTS: tl.constexpr,
+    BINS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    b = tl.program_id(0)
+    off = b * BLOCK + tl.arange(0, BLOCK)
+    # Out-of-range lanes land on the sentinel bin, as in
+    # fused_moe._count_experts.
+    e = tl.load(expert_ids + off, mask=off < num_routes, other=NUM_EXPERTS)
+    local = tl.histogram(e, BINS)
+    bins = tl.arange(0, BINS)
+    tl.store(block_hist + b * BINS + bins, local)
+    tl.atomic_add(counts + bins, local, mask=bins < NUM_EXPERTS)
+
+
+# The permute step of the counting sort, made stable: a route's rank within its
+# expert is the number of earlier routes to that expert, so the padded layout
+# -- and with it the summation order of every weight-gradient K loop -- is a
+# pure function of expert_ids. fused_moe._scatter_routes claims rows with an
+# atomic cursor, which is fine for inference, where rows are independent, but
+# made dW differ bitwise between identical training steps. Earlier blocks
+# contribute through their histograms; within the block, sorting on
+# (expert, position) orders each expert's routes. Each route's weight goes onto
+# its row; row_w is zero-initialized, so padding rows weigh 0.
+@triton.jit
+def _scatter_routes_stable(
+    expert_ids,
+    weights,
+    block_hist,
+    route_tokens,
+    route_rows,
+    row_w,
+    expert_row_start,
+    num_routes,  # runtime, not constexpr -- see fused_moe._plan_tiles
+    NUM_EXPERTS: tl.constexpr,
+    BINS: tl.constexpr,
+    TOP_K: tl.constexpr,
+    BLOCK: tl.constexpr,
+    PREFIX_BLOCKS: tl.constexpr,
+):
+    b = tl.program_id(0)
+    bins = tl.arange(0, BINS)
+    earlier = tl.zeros((BINS,), dtype=tl.int32)
+    for b0 in range(0, b, PREFIX_BLOCKS):
+        prev = b0 + tl.arange(0, PREFIX_BLOCKS)
+        earlier += tl.sum(
+            tl.load(block_hist + prev[:, None] * BINS + bins[None, :],
+                    mask=(prev < b)[:, None], other=0),
+            axis=0,
+        )
+    hist = tl.load(block_hist + b * BINS + bins)
+    # Sorted position p of expert e's routes in this block is row base[e] + p.
+    base = (tl.load(expert_row_start + bins, mask=bins < NUM_EXPERTS, other=0)
+            + earlier - (tl.cumsum(hist, 0) - hist))
+
+    pos = tl.arange(0, BLOCK)
+    r = b * BLOCK + pos
+    e = tl.load(expert_ids + r, mask=r < num_routes, other=NUM_EXPERTS)
+    key = tl.sort(e * BLOCK + pos)  # ties broken by position: stable
+    route = b * BLOCK + key % BLOCK
+    live = route < num_routes
+    row = tl.gather(base, key // BLOCK, 0) + pos
+    tl.store(route_rows + route, row, mask=live)
+    tl.store(route_tokens + row, route // TOP_K, mask=live)
+    tl.store(row_w + row, tl.load(weights + route, mask=live).to(tl.float32),
+             mask=live)
+
+
 # One projection over gathered rows: out[row, :w_e] = x[tok(row)] @ W_e.
 # Padding rows load x as zero, so they produce exact zeros.
 @triton.jit
@@ -83,6 +171,7 @@ def _proj_rows(
     out,
     g_in,
     h_out,
+    row_w,
     route_tokens,
     tile_expert,
     expert_col_off,
@@ -120,28 +209,30 @@ def _proj_rows(
 
     dst = rows[:, None] * MAX_W + local[None, :]
     out_value = acc.to(out.dtype.element_ty)
+    if FUSE_SILU:
+        # Issued after the store below, this load cost ~450 B of epilogue
+        # spills (ptxas, sm_86); here it costs ~50 B.
+        ww = tl.load(row_w + rows[:, None])
     tl.store(out + dst, out_value)
     if FUSE_SILU:
         # Preserve the old numerics: the standalone kernel consumed the bf16
         # value after the projection store, not the fp32 accumulator.
+        # _silu_mul repeats this operation order for recompute_activation.
         gg = tl.load(g_in + dst).to(tl.float32)
         uu = out_value.to(tl.float32)
         tl.store(h_out + dst,
-                 (gg * tl.sigmoid(gg) * uu).to(h_out.dtype.element_ty))
+                 (gg * tl.sigmoid(gg) * uu * ww).to(h_out.dtype.element_ty))
 
 
-# One program per route. Splits dout at the reduction boundary: the row grad
-# picks up the routing weight (dy_row = w_r * dout[token]) and the routing
-# weight grad is the unweighted dot (dw_r = <y_row, dout[token]>). Every route
-# owns exactly one padded row, so there are no write conflicts; padding rows
-# are never a route's destination and stay at their zero initialization.
+# One program per route: dy_rows[row] = dout[token]. h already carries the
+# routing weight, so the down projection's output gradient is the token's own,
+# unscaled. Every route owns exactly one padded row, so there are no write
+# conflicts; padding rows are never a route's destination and stay at their
+# zero initialization.
 @triton.jit
 def _route_bwd(
     dout,
-    y,
-    weights,
     dy_rows,
-    dw,
     route_rows,
     NUM_COLUMNS: tl.constexpr,
     TOP_K: tl.constexpr,
@@ -149,25 +240,19 @@ def _route_bwd(
 ):
     r = tl.program_id(0)
     row = tl.load(route_rows + r)
-    tok = r // TOP_K
-    w = tl.load(weights + r).to(tl.float32)
-
-    src = dout + tok * NUM_COLUMNS
-    yp = y + row * NUM_COLUMNS
+    src = dout + (r // TOP_K) * NUM_COLUMNS
     dst = dy_rows + row * NUM_COLUMNS
-    acc = tl.zeros((BLOCK_X,), dtype=tl.float32)
     for col_base in range(0, NUM_COLUMNS, BLOCK_X):
         cols = col_base + tl.arange(0, BLOCK_X)
         mask = cols < NUM_COLUMNS
-        d = tl.load(src + cols, mask=mask, other=0.0).to(tl.float32)
-        yv = tl.load(yp + cols, mask=mask, other=0.0).to(tl.float32)
-        tl.store(dst + cols, (w * d).to(dy_rows.dtype.element_ty), mask=mask)
-        acc += yv * d
-    tl.store(dw + r, tl.sum(acc))
+        tl.store(dst + cols, tl.load(src + cols, mask=mask), mask=mask)
 
 
-# dh = dy_rows @ Wd^T for the expert's own width, then the SwiGLU backward on
-# the fp32 tile: dg = dh * u * silu'(g), du = dh * silu(g), with
+# da = dy_rows @ Wd^T for the expert's own width: the gradient with respect to
+# the weighted activation w_r * h. Its row dot with the unweighted
+# h = silu(g) * u is this tile's share of dw_r, written to dw_part[row, nt]
+# for _route_dw. dh = w_r * da then feeds the SwiGLU backward on the fp32
+# tile: dg = dh * u * silu'(g), du = dh * silu(g), with
 # silu'(g) = sig(g) * (1 + g * (1 - sig(g))). Wd rows are loaded contiguously
 # as (N, K) and transposed in-register.
 @triton.jit
@@ -176,13 +261,16 @@ def _dgu(
     wd,
     g_in,
     u_in,
+    row_w,
     dg_out,
     du_out,
+    dw_part,
     tile_expert,
     expert_col_off,
     expert_nblocks,
     HIDDEN: tl.constexpr,
     MAX_W: tl.constexpr,
+    NUM_NT: tl.constexpr,  # dw_part columns: the grid's width-tile count
     NBLOCK_N: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -213,10 +301,37 @@ def _dgu(
     uu = tl.load(u_in + src).to(tl.float32)
     sig = tl.sigmoid(gg)
     silu = gg * sig
-    dg = acc * uu * (sig * (1.0 + gg * (1.0 - sig)))
-    du = acc * silu
+    # Keeping the row sum 2D keeps the reduction in the accumulator's layout;
+    # a 1D result made Triton convert the whole fp32 tile first and spill.
+    tl.store(dw_part + rows[:, None] * NUM_NT + nt,
+             tl.sum(acc * silu * uu, axis=1, keep_dims=True))
+    dh = acc * tl.load(row_w + rows[:, None])
+    dg = dh * uu * (sig * (1.0 + gg * (1.0 - sig)))
+    du = dh * silu
     tl.store(dg_out + src, dg.to(dg_out.dtype.element_ty))
     tl.store(du_out + src, du.to(du_out.dtype.element_ty))
+
+
+# dw_r = the sum, in tile order, of the partials _dgu wrote for route r's row.
+# Tiles past the expert's width never run and keep their zero initialization,
+# so the sum needs no width mask.
+@triton.jit
+def _route_dw(
+    dw,
+    dw_part,
+    route_rows,
+    num_routes,  # runtime, not constexpr -- see fused_moe._plan_tiles
+    NUM_NT: tl.constexpr,
+    BLOCK_NT: tl.constexpr,
+    BLOCK_X: tl.constexpr,
+):
+    r = tl.program_id(0) * BLOCK_X + tl.arange(0, BLOCK_X)
+    m = r < num_routes
+    row = tl.load(route_rows + r, mask=m, other=0)
+    nt = tl.arange(0, BLOCK_NT)
+    part = tl.load(dw_part + row[:, None] * NUM_NT + nt[None, :],
+                   mask=m[:, None] & (nt[None, :] < NUM_NT), other=0.0)
+    tl.store(dw + r, tl.sum(part, axis=1), mask=m)
 
 
 # dW[c, h] = sum over the expert's padded rows of a[row, c] * b[row, h] where
@@ -364,21 +479,26 @@ def _dx_rows_fused(
     tl.store(dst, acc.to(dx.dtype.element_ty))
 
 
-# h = silu(g) * u in one pass. F.silu(g) * u is two eager kernels and an
-# extra intermediate write; this is one read of g/u and one write of h.
+# h = w_r * silu(g) * u in one pass, in the same operation order as
+# _proj_rows' epilogue. F.silu(g) * u is two eager kernels and an extra
+# intermediate write; this is one read of g/u and one write of h.
 @triton.jit
 def _silu_mul(
     g_in,
     u_in,
+    row_w,
     h_out,
     numel,
+    NUM_COLUMNS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     off = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     m = off < numel
     gg = tl.load(g_in + off, mask=m, other=0.0).to(tl.float32)
     uu = tl.load(u_in + off, mask=m, other=0.0).to(tl.float32)
-    tl.store(h_out + off, (gg * tl.sigmoid(gg) * uu).to(h_out.dtype.element_ty),
+    ww = tl.load(row_w + off // NUM_COLUMNS, mask=m, other=0.0)
+    tl.store(h_out + off,
+             (gg * tl.sigmoid(gg) * uu * ww).to(h_out.dtype.element_ty),
              mask=m)
 
 
@@ -402,11 +522,75 @@ def _zero_pad_rows(
                  mask=cols < NUM_COLUMNS)
 
 
-def _silu_mul_launch(g, u):
+def _silu_mul_launch(g, u, row_w):
     h = torch.empty_like(g)
     n = g.numel()
-    _silu_mul[(triton.cdiv(n, 4096),)](g, u, h, n, BLOCK=4096, num_warps=8)
+    _silu_mul[(triton.cdiv(n, 4096),)](g, u, row_w, h, n,
+                                       NUM_COLUMNS=g.shape[1],
+                                       BLOCK=4096, num_warps=8)
     return h
+
+
+def _route(expert_ids, top_weights, plan, top_k, m_tiles, row_bound):
+    """Stable counting sort of the routes into the padded row-tile layout.
+
+    Returns (tile_expert, route_tokens, route_rows, row_w): each row tile's
+    expert (-1 if unclaimed), each padded row's token (-1 for padding), each
+    route's padded row, and each padded row's routing weight (0 for padding).
+    The layout is a pure function of expert_ids. Leaves this call's values in
+    plan.counts and plan.expert_row_start.
+    """
+    num_routes = expert_ids.numel()
+    dev = expert_ids.device
+    tile_expert = torch.empty(m_tiles, dtype=torch.int32, device=dev)
+    route_tokens = torch.empty(row_bound, dtype=torch.int32, device=dev)
+    route_rows = torch.empty(num_routes, dtype=torch.int32, device=dev)
+
+    route_blocks = triton.cdiv(num_routes, _ROUTE_BLOCK)
+    block_hist = torch.empty((route_blocks, plan.count_bins),
+                             dtype=torch.int32, device=dev)
+    plan.counts.zero_()
+    _count_blocks[(route_blocks,)](
+        expert_ids,
+        plan.counts,
+        block_hist,
+        num_routes,
+        NUM_EXPERTS=plan.num_experts,
+        BINS=plan.count_bins,
+        BLOCK=_ROUTE_BLOCK,
+        num_warps=4,
+    )
+    _plan_tiles[(1,)](
+        plan.counts,
+        plan.expert_row_start,
+        plan.cursor,
+        tile_expert,
+        route_tokens,
+        m_tiles,
+        NUM_EXPERTS=plan.num_experts,
+        BLOCK_E=plan.block_e,
+        BLOCK_M=_ROW_BLOCK,
+        FILL=1024,
+        num_warps=4,
+    )
+    row_w = torch.zeros(row_bound, dtype=torch.float32, device=dev)
+    _scatter_routes_stable[(route_blocks,)](
+        expert_ids,
+        top_weights,
+        block_hist,
+        route_tokens,
+        route_rows,
+        row_w,
+        plan.expert_row_start,
+        num_routes,
+        NUM_EXPERTS=plan.num_experts,
+        BINS=plan.count_bins,
+        TOP_K=top_k,
+        BLOCK=_ROUTE_BLOCK,
+        PREFIX_BLOCKS=8,
+        num_warps=4,
+    )
+    return tile_expert, route_tokens, route_rows, row_w
 
 
 def _wb_expert_table(plan, block_w):
@@ -461,44 +645,8 @@ class _GroupedMoE(torch.autograd.Function):
         m_tiles, row_bound = plan.bounds(num_tokens, top_k, bm)
         dev = x.device
 
-        tile_expert = torch.empty(m_tiles, dtype=torch.int32, device=dev)
-        route_tokens = torch.empty(row_bound, dtype=torch.int32, device=dev)
-        route_rows = torch.empty(num_routes, dtype=torch.int32, device=dev)
-
-        plan.counts.zero_()
-        _count_experts[(triton.cdiv(num_routes, 1024),)](
-            expert_ids,
-            plan.counts,
-            num_routes,
-            NUM_EXPERTS=plan.num_experts,
-            BINS=plan.count_bins,
-            BLOCK=1024,
-            num_warps=4,
-        )
-        _plan_tiles[(1,)](
-            plan.counts,
-            plan.expert_row_start,
-            plan.cursor,
-            tile_expert,
-            route_tokens,
-            m_tiles,
-            NUM_EXPERTS=plan.num_experts,
-            BLOCK_E=plan.block_e,
-            BLOCK_M=bm,
-            FILL=1024,
-            num_warps=4,
-        )
-        _scatter_routes[(triton.cdiv(num_routes, 256),)](
-            expert_ids,
-            route_tokens,
-            route_rows,
-            plan.cursor,
-            plan.expert_row_start,
-            num_routes,
-            TOP_K=top_k,
-            BLOCK_X=256,
-            num_warps=4,
-        )
+        tile_expert, route_tokens, route_rows, row_w = _route(
+            expert_ids, top_weights, plan, top_k, m_tiles, row_bound)
         # plan.counts / plan.expert_row_start are shared scratch that the next
         # forward overwrites; backward needs this call's values.
         counts = plan.counts.clone()
@@ -521,6 +669,7 @@ class _GroupedMoE(torch.autograd.Function):
                 out,
                 g,
                 h,
+                row_w,
                 route_tokens,
                 tile_expert,
                 plan.expert_col_off,
@@ -580,15 +729,15 @@ class _GroupedMoE(torch.autograd.Function):
             out,
             y,
             route_rows,
-            top_weights,
+            None,
             NUM_COLUMNS=hidden,
             TOP_K=top_k,
-            SCALE=True,
+            SCALE=False,
         )
 
         saved = (x, top_weights, w_gate, w_up, w_down,
                  route_tokens, route_rows, tile_expert,
-                 counts, row_start, g, u, y)
+                 counts, row_start, g, u, row_w)
         if saved_h is not None:
             saved += (saved_h,)
         ctx.save_for_backward(*saved)
@@ -603,7 +752,7 @@ class _GroupedMoE(torch.autograd.Function):
     def backward(ctx, dout):
         (x, top_weights, w_gate, w_up, w_down,
          route_tokens, route_rows, tile_expert,
-         counts, row_start, g, u, y) = ctx.saved_tensors[:13]
+         counts, row_start, g, u, row_w) = ctx.saved_tensors[:13]
         plan, top_k = ctx.plan, ctx.top_k
         bm, m_tiles, row_bound = ctx.launch
         num_tokens, hidden = x.shape
@@ -623,13 +772,9 @@ class _GroupedMoE(torch.autograd.Function):
             BLOCK_X=1024,
             num_warps=4,
         )
-        dw_routes = torch.empty(num_routes, dtype=torch.float32, device=dev)
         _route_bwd[(num_routes,)](
             dout,
-            y,
-            top_weights,
             dy_rows,
-            dw_routes,
             route_rows,
             NUM_COLUMNS=hidden,
             TOP_K=top_k,
@@ -640,18 +785,24 @@ class _GroupedMoE(torch.autograd.Function):
         gm, gn, gk, gw, gs = _CFG['dgu']
         dg = torch.empty_like(g)
         du = torch.empty_like(u)
-        _dgu[(m_tiles, (plan.max_width + gn - 1) // gn)](
+        dgu_nt = (plan.max_width + gn - 1) // gn
+        dw_part = torch.zeros((row_bound, dgu_nt), dtype=torch.float32,
+                              device=dev)
+        _dgu[(m_tiles, dgu_nt)](
             dy_rows,
             w_down,
             g,
             u,
+            row_w,
             dg,
             du,
+            dw_part,
             tile_expert,
             plan.expert_col_off,
             plan.expert_nblocks,
             HIDDEN=hidden,
             MAX_W=plan.max_width,
+            NUM_NT=dgu_nt,
             NBLOCK_N=gn // bn,
             BLOCK_M=gm,
             BLOCK_N=gn,
@@ -659,11 +810,22 @@ class _GroupedMoE(torch.autograd.Function):
             num_warps=gw,
             num_stages=gs,
         )
+        dw_routes = torch.empty(num_routes, dtype=torch.float32, device=dev)
+        _route_dw[(triton.cdiv(num_routes, 256),)](
+            dw_routes,
+            dw_part,
+            route_rows,
+            num_routes,
+            NUM_NT=dgu_nt,
+            BLOCK_NT=triton.next_power_of_2(dgu_nt),
+            BLOCK_X=256,
+            num_warps=4,
+        )
 
-        # One elementwise pass beats recomputing silu(g)*u inside every K
-        # iteration of the weight-gradient kernel. Transient; freed after.
+        # One elementwise pass beats recomputing w_r * silu(g) * u inside
+        # every K iteration of the weight-gradient kernel. Transient.
         h = (
-            _silu_mul_launch(g, u)
+            _silu_mul_launch(g, u, row_w)
             if ctx.recompute_activation
             else ctx.saved_tensors[13]
         )

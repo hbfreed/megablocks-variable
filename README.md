@@ -13,8 +13,8 @@ inference, and training.
 
 - A fused Triton inference path with device-side counting-sort routing and
   row tiles sized for decode and prefill.
-- A differentiable grouped-MoE training path with deterministic forward and
-  backward kernels and no STK dependency.
+- A differentiable grouped-MoE training path with no STK dependency whose
+  forward and backward are bitwise reproducible from run to run.
 - An optional CuTe DSL backend for the dominant Ampere training GEMMs.
 - Score-aware nearest-block route dropping for reducing training padding.
 - Extension-free installation for the default Triton paths.

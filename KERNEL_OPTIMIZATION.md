@@ -356,3 +356,103 @@ The backend remains opt-in because CUTLASS DSL is a large optional dependency
 and the implementation currently supports only BF16 Ampere with hidden sizes
 divisible by 256. Install `megablocks[cute]` and pass
 `down_proj_backend="cute"` to `grouped_moe`; Triton remains the default.
+
+## Saved-output removal and stable routing (2026-10-29)
+
+Prime Intellect's
+[Mega MoE training kernels](https://www.primeintellect.ai/blog/prime-mega-moe)
+add a backward to DeepGEMM's fused Mega MoE forward. The kernels are closed
+source, but prime-rl's wrapper shows what autograd keeps: the layer input, the
+routing, and the expert weights. The backward still returns the
+routing-weight gradient. DeepGEMM's public forward multiplies the routing
+weight into the SwiGLU output before the down projection, so its top-k combine
+is an unweighted sum.
+
+The grouped training path now does the same:
+
+- The up projection's SwiGLU epilogue writes `h = w_r * silu(g) * u`. Routing
+  places each `w_r` on its route's padded row. The down projection's output is
+  already weighted, so `_scatter_reduce` sums it unscaled.
+- Backward recovers the routing-weight gradient from the intermediate:
+  `<y_row, dout> = <silu(g) * u, dout @ Wd^T>`. `_dgu` already holds
+  `dout @ Wd^T`, `g`, and `u` in registers. It writes one partial dot per
+  width tile, and `_route_dw` sums each route's partials in tile order.
+  `_route_bwd` now only copies `dout` into the padded rows.
+- The `(rows, hidden)` down-projection output is no longer saved. At the
+  layer shape below it is 155 MiB, twice the optional retained activation.
+
+The measurements below used one RTX 3090 and the locked stack: Torch
+2.12.1+cu130, Triton 3.7.1, and CUTLASS DSL 4.6.3. The layer had hidden size
+2048, 4096 tokens, and top-k 8. The width table was synthetic: 54 experts with
+total width 32768 and widths from 128 to 1024. It is not the served keep50
+table, so absolute times do not compare with the tables above. Memory is the
+allocator delta for one layer:
+
+| one layer | before | after |
+|---|---:|---:|
+| held after forward, recompute activation | 327.8 MiB | 171.9 MiB |
+| held after forward, retain activation | 405.8 MiB | 249.9 MiB |
+| forward + backward peak, recompute activation | 1196.0 MiB | 1041.3 MiB |
+| forward + backward peak, retain activation | 1274.0 MiB | 1119.3 MiB |
+
+Two epilogue details mattered. A 1D row sum in `_dgu` made Triton convert the
+whole fp32 accumulator to the store layout before reducing. ptxas reported
+1012 bytes of epilogue spills on sm_86, against 72 bytes before the change.
+`tl.sum(..., keep_dims=True)` keeps the reduction in the MMA layout and cuts
+the spills to 240 bytes. In the up projection, loading the row weight after
+the `u` store cost 448 bytes of spills. Loading it before the store costs 64
+bytes, against 12 bytes before the change. All of these spills fall after the
+K loop.
+
+Recovering `dw_r` as `rowsum(du * u) / w_r` would avoid the reduction in
+`_dgu`, but it returns 0/0 for zero-weight routes, so it was rejected.
+
+Weight gradients were also not reproducible from run to run, although the
+README described the training path as deterministic. `_scatter_routes` claims
+padded rows with an atomic cursor, so each expert's row order followed atomic
+arrival order. Between identical steps, 92% to 99.7% of routes moved to
+different rows. `out`, `dx`, and the routing-weight gradient are computed per
+row and stayed bitwise stable. `dWg`, `dWu`, and `dWd` sum rows in padded-row
+order and changed on every run. The test configuration enables
+`torch.use_deterministic_algorithms`, which cannot see Triton atomics.
+
+The training path now uses a stable counting sort. `_count_blocks` stores
+each 1024-route block's histogram alongside the per-expert totals.
+`_scatter_routes_stable` adds the earlier blocks' histograms to each expert's
+row start, then sorts its own block on (expert, position). Each expert's
+routes therefore fill its rows in route order. The same kernel writes the
+routing weights, so the routing launch count is unchanged. The serving path
+keeps the atomic permute because its forward is per row.
+
+The stable permute is not slower. It took 10.9 us of GPU time per call against
+12.2 us for the atomic permute at 32768 routes, and 24.7 us against 26.4 us at
+131072 routes. Sorting within a block avoids contention on the expert cursors.
+The whole routing stage, including zeroing the weight buffer, took 19.4 us
+against 19.5 us. A stable `torch.sort` followed by a scatter was also
+deterministic, but it cost about 65 us per layer step in paired measurements,
+roughly the whole saving from dropping `y`.
+
+With both changes, 150 rotated paired forward + backward measurements gave:
+
+| backend | activation | before | after | paired median saving | after faster |
+|---|---|---:|---:|---:|---:|
+| Triton | recompute | 15.659 ms | 15.581 ms | 0.076 ms | 90/150 |
+| Triton | retain | 15.436 ms | 15.385 ms | 0.088 ms | 87/150 |
+| CuTe | recompute | 14.055 ms | 13.940 ms | 0.075 ms | 97/150 |
+| CuTe | retain | 14.129 ms | 14.005 ms | 0.083 ms | 119/150 |
+
+Errors against the dense fp32 reference matched or slightly improved on the
+previous implementation for every gradient. The routing-weight gradient
+improved most, from 3.7e-3 to 7.6e-3 down to 2.6e-3 to 3.5e-3, because it now
+comes from fp32 intermediates instead of the bf16 `y`.
+
+New tests cover the change:
+
+- `test_training_step_is_bitwise_reproducible` fails on the previous
+  implementation (`dWg` differed bitwise) and passes now.
+- `test_routing_layout_is_stable` checks the exact layout, including the
+  chunked prefix sum at twelve blocks.
+- `test_zero_routing_weights` covers zero-weight routes, and
+  `test_forward_saves_no_hidden_wide_route_buffer` checks that no
+  `(rows, hidden)` buffer is saved.
+- Every Triton reference case now also runs with the activation retained.
