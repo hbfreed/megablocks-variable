@@ -197,11 +197,13 @@ def _count_route_keys(
 
 # One program: where each expert's routes start in the sorted keys, and how
 # many of them it keeps -- min(count, count rounded half up to BLOCK_M), as in
-# gpt_model's _block_tokens_per_expert. _plan_tiles then plans the kept counts.
+# gpt_model's _block_tokens_per_expert. _plan_tiles then plans the kept counts;
+# the original counts go to routed_counts for _route_stats.
 @triton.jit
 def _round_counts(
     counts,
     sorted_start,
+    routed_counts,
     NUM_EXPERTS: tl.constexpr,
     BLOCK_E: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -209,9 +211,32 @@ def _round_counts(
     e = tl.arange(0, BLOCK_E)
     live = e < NUM_EXPERTS
     n = tl.load(counts + e, mask=live, other=0)
+    tl.store(routed_counts + e, n, mask=live)
     tl.store(sorted_start + e, tl.cumsum(n, 0) - n, mask=live)
     rounded = (n + BLOCK_M // 2) // BLOCK_M * BLOCK_M
     tl.store(counts + e, tl.minimum(n, rounded), mask=live)
+
+
+# Dropped routes and padding rows as fractions of all routes -- the quantities
+# gpt_model.MoEMLP reports -- left on the device so logging them does not
+# synchronize. An expert pads its kept routes up to whole BLOCK_M row tiles.
+@triton.jit
+def _route_stats(
+    routed_counts,
+    kept_counts,
+    stats,
+    num_routes,  # runtime, not constexpr -- see fused_moe._plan_tiles
+    NUM_EXPERTS: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    e = tl.arange(0, BLOCK_E)
+    live = e < NUM_EXPERTS
+    n = tl.load(routed_counts + e, mask=live, other=0)
+    kept = tl.load(kept_counts + e, mask=live, other=0)
+    rows = (kept + BLOCK_M - 1) // BLOCK_M * BLOCK_M
+    tl.store(stats, tl.sum(n - kept, 0).to(tl.float32) / num_routes)
+    tl.store(stats + 1, tl.sum(rows - kept, 0).to(tl.float32) / num_routes)
 
 
 # Rows for the kept routes, in descending-score order within each expert. A
@@ -625,7 +650,7 @@ def _route_score_bits(num_experts):
 
 
 def _route(expert_ids, top_weights, plan, top_k, m_tiles, row_bound,
-           token_rounding='ceil', route_scores=None):
+           token_rounding='ceil', route_scores=None, stats=None):
     """Counting sort of the routes into the padded row-tile layout.
 
     Returns (tile_expert, route_tokens, route_rows, row_w): each row tile's
@@ -636,6 +661,8 @@ def _route(expert_ids, top_weights, plan, top_k, m_tiles, row_bound,
     whole row tiles, highest route_scores first (top_weights when route_scores
     is None). Either layout is a pure function of the inputs. Leaves this
     call's kept counts in plan.counts and row starts in plan.expert_row_start.
+    A float32 (2,) `stats` receives the dropped-route and padding-row
+    fractions (see _route_stats).
     """
     num_routes = expert_ids.numel()
     dev = expert_ids.device
@@ -658,6 +685,7 @@ def _route(expert_ids, top_weights, plan, top_k, m_tiles, row_bound,
             BLOCK=_ROUTE_BLOCK,
             num_warps=4,
         )
+        routed_counts = plan.counts
     else:
         score_bits = _route_score_bits(plan.num_experts)
         route_keys = torch.empty_like(expert_ids)
@@ -676,9 +704,11 @@ def _route(expert_ids, top_weights, plan, top_k, m_tiles, row_bound,
         )
         sorted_keys, order = torch.sort(route_keys, stable=True)
         sorted_start = torch.empty_like(plan.counts)
+        routed_counts = torch.empty_like(plan.counts)
         _round_counts[(1,)](
             plan.counts,
             sorted_start,
+            routed_counts,
             NUM_EXPERTS=plan.num_experts,
             BLOCK_E=plan.block_e,
             BLOCK_M=_ROW_BLOCK,
@@ -732,6 +762,17 @@ def _route(expert_ids, top_weights, plan, top_k, m_tiles, row_bound,
             BLOCK_X=256,
             num_warps=4,
         )
+    if stats is not None:
+        _route_stats[(1,)](
+            routed_counts,
+            plan.counts,
+            stats,
+            num_routes,
+            NUM_EXPERTS=plan.num_experts,
+            BLOCK_E=plan.block_e,
+            BLOCK_M=_ROW_BLOCK,
+            num_warps=4,
+        )
     return tile_expert, route_tokens, route_rows, row_w
 
 
@@ -767,6 +808,7 @@ class _GroupedMoE(torch.autograd.Function):
         recompute_activation,
         token_rounding,
         route_scores,
+        return_route_stats,
     ):
         num_tokens, hidden = x.shape
         num_routes = num_tokens * top_k
@@ -798,9 +840,11 @@ class _GroupedMoE(torch.autograd.Function):
         m_tiles, row_bound = plan.bounds(num_tokens, top_k, bm)
         dev = x.device
 
+        stats = (torch.empty(2, dtype=torch.float32, device=dev)
+                 if return_route_stats else None)
         tile_expert, route_tokens, route_rows, row_w = _route(
             expert_ids, top_weights, plan, top_k, m_tiles, row_bound,
-            token_rounding, route_scores)
+            token_rounding, route_scores, stats)
         # plan.counts / plan.expert_row_start are shared scratch that the next
         # forward overwrites; backward needs this call's values.
         counts = plan.counts.clone()
@@ -900,10 +944,13 @@ class _GroupedMoE(torch.autograd.Function):
         ctx.launch = (bm, m_tiles, row_bound)
         ctx.down_proj_backend = down_proj_backend
         ctx.recompute_activation = recompute_activation
-        return out
+        if stats is None:
+            return out
+        ctx.mark_non_differentiable(stats)
+        return out, stats
 
     @staticmethod
-    def backward(ctx, dout):
+    def backward(ctx, dout, *_):
         (x, top_weights, w_gate, w_up, w_down,
          route_tokens, route_rows, tile_expert,
          counts, row_start, g, u, row_w) = ctx.saved_tensors[:13]
@@ -1092,7 +1139,7 @@ class _GroupedMoE(torch.autograd.Function):
         )
 
         return (dx, dw_routes.to(top_weights.dtype), None,
-                dwg, dwu, dwd, None, None, None, None, None, None)
+                dwg, dwu, dwd, None, None, None, None, None, None, None)
 
 
 def grouped_moe(
@@ -1108,6 +1155,7 @@ def grouped_moe(
     recompute_activation=True,
     token_rounding='ceil',
     route_scores=None,
+    return_route_stats=False,
 ):
     """Differentiable gated MoE over packed variable-width experts.
 
@@ -1129,8 +1177,21 @@ def grouped_moe(
     e.g. the router probabilities before top-k renormalization) ranks the
     routes; it defaults to ``top_weights``. The default ``'ceil'`` keeps every
     route and pads each expert to whole tiles instead.
+
+    ``return_route_stats=True`` returns ``(output, stats)``, where ``stats``
+    maps ``'dropped_route_fraction'`` and ``'padding_route_fraction'`` --
+    gpt_model.MoEMLP's names -- to 0-dim float32 tensors left on the device,
+    so logging them does not synchronize.
     """
-    return _GroupedMoE.apply(x, top_weights, expert_ids,
-                             w_gate, w_up, w_down, plan, top_k,
-                             down_proj_backend, recompute_activation,
-                             token_rounding, route_scores)
+    result = _GroupedMoE.apply(x, top_weights, expert_ids,
+                               w_gate, w_up, w_down, plan, top_k,
+                               down_proj_backend, recompute_activation,
+                               token_rounding, route_scores,
+                               return_route_stats)
+    if not return_route_stats:
+        return result
+    out, stats = result
+    return out, {
+        'dropped_route_fraction': stats[0],
+        'padding_route_fraction': stats[1],
+    }

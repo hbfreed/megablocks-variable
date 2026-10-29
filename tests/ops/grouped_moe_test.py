@@ -393,3 +393,45 @@ def test_nearest_rounding_layout():
     padding[rows[keep]] = False
     assert bool((route_tokens[:claimed][padding] == -1).all())
     assert bool((row_w[:claimed][padding] == 0).all())
+
+
+@pytest.mark.gpu
+@pytest.mark.world_size(1)
+@pytest.mark.parametrize('token_rounding', ['ceil', 'nearest'])
+def test_route_stats(token_rounding):
+    # The fractions gpt_model.MoEMLP reports, left on the device. Asking for
+    # them must not change the output or any gradient.
+    widths, top_k = [128, 256, 384, 512] * 16, 6
+    inputs = _inputs(widths, 1024, top_k, 1500, renormalize=True)
+    x, top_w, top_e, w_gate, w_up, w_down, dout, plan, scores = inputs
+    want_out, want_grads = _step(inputs, top_k, token_rounding=token_rounding)
+
+    nearest = token_rounding == 'nearest'
+    out, stats = grouped_moe(
+        x, top_w.flatten(), top_e.flatten().int(), plan, top_k, w_gate, w_up,
+        w_down, token_rounding=token_rounding,
+        route_scores=scores.flatten() if nearest else None,
+        return_route_stats=True)
+    out.backward(dout)
+    leaves = (x, top_w, w_gate, w_up, w_down)
+    assert torch.equal(out.detach(), want_out)
+    for name, leaf, want in zip(_GRAD_NAMES, leaves, want_grads):
+        assert torch.equal(leaf.grad, want), f'{name} changed'
+        leaf.grad = None
+
+    e = top_e.flatten().long().cpu()
+    counts = torch.bincount(e, minlength=len(widths))
+    kept = counts
+    if nearest:
+        keep, _ = _nearest_rounding(top_e, scores, len(widths))
+        kept = torch.bincount(e[keep.flatten()], minlength=len(widths))
+    block = grouped_moe_module._ROW_BLOCK
+    rows = (kept + block - 1) // block * block
+    dropped = float((counts - kept).sum()) / e.numel()
+    padding = float((rows - kept).sum()) / e.numel()
+    assert (dropped > 0) == nearest
+    for name, want in (('dropped_route_fraction', dropped),
+                       ('padding_route_fraction', padding)):
+        got = stats[name]
+        assert got.device.type == 'cuda' and got.dim() == 0
+        assert abs(got.item() - want) < 1e-6, (name, got.item(), want)
