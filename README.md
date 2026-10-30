@@ -16,7 +16,8 @@ inference, and training.
 - A differentiable grouped-MoE training path with no STK dependency whose
   forward and backward are bitwise reproducible from run to run.
 - An optional CuTe DSL backend for the dominant Ampere training GEMMs.
-- Score-aware nearest-block route dropping for reducing training padding.
+- Score-aware nearest-block route dropping for reducing training padding,
+  including `token_rounding='nearest'` in the grouped training path.
 - Extension-free installation for the default Triton paths.
 
 The implementation is intentionally compact. Legacy upstream model layers and

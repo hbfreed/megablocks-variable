@@ -456,3 +456,98 @@ New tests cover the change:
   `test_forward_saves_no_hidden_wide_route_buffer` checks that no
   `(rows, hidden)` buffer is saved.
 - Every Triton reference case now also runs with the activation retained.
+
+## Token rounding and route statistics (2026-10-29)
+
+Each expert's routes are padded up to whole 128-row tiles, and the padding
+rows go through all three GEMMs, forward and backward. With
+`token_rounding='nearest'`, each expert's route count is instead rounded half
+up to whole tiles. This is the rule gpt_model's `token_rounding='nearest'`
+uses, like SonicMoE's token rounding. An expert that rounds down drops its
+lowest-scoring routes. A dropped route contributes nothing to the output and
+receives no gradient, and the surviving routing weights are not renormalized.
+An expert with fewer than 64 routes in a step therefore keeps none of them.
+`route_scores` ranks the routes, for example by router probability before
+top-k renormalization, and defaults to `top_weights`. The default, `'ceil'`,
+keeps every route.
+
+In this mode `_count_route_keys` counts each expert's routes and packs each
+route into an int32 key: the expert in the high bits, the quantized score
+(descending) in the low bits. A stable `torch.sort` then ranks each expert's
+routes by score, keeping ties in route order. `_round_counts` computes the
+kept counts. `_scatter_routes_ranked` gives each kept route its row and each
+dropped route row -1, which `_scatter_reduce`, `_route_bwd`, and `_route_dw`
+skip. The layout is a pure function of the inputs, so the step stays bitwise
+reproducible.
+
+`return_route_stats=True` also returns `dropped_route_fraction` and
+`padding_route_fraction`, gpt_model.MoEMLP's names. Both are fractions of all
+routes. `_route_stats` computes them in one program and leaves them on the
+device, so logging them does not synchronize.
+
+The benchmark used the layer above with skewed routing: each expert's router
+logit got a fixed random offset with standard deviation 1.0. Under uniform
+random routing every expert's count lands near the same value, so the
+rounding outcome depends on where that value falls relative to a tile. Here
+nearest rounding dropped 3.10% of the routes. Ceil padding had been 12.5% of
+the routes, and GEMM rows weighted by expert width fell by 13.7%. With card 2
+to itself, 150 rotated pairs per row gave:
+
+| backend | activation | ceil | nearest | paired median saving | nearest faster |
+|---|---|---:|---:|---:|---:|
+| Triton | recompute | 15.594 ms | 13.969 ms | 1.646 ms | 150/150 |
+| Triton | retain | 15.815 ms | 14.076 ms | 1.894 ms | 150/150 |
+| CuTe | recompute | 14.194 ms | 12.712 ms | 1.516 ms | 149/150 |
+| CuTe | retain | 14.310 ms | 12.827 ms | 1.535 ms | 150/150 |
+
+The step was 10.6% to 12.0% faster. That is a little less than the 13.7% row
+reduction, since the rest of the step, routing included, does not shrink.
+
+Ceil pads about half a tile per expert on average. Nearest moves each count
+by about a quarter tile, dropping routes for roughly half of the experts and
+padding the rest. Both shares fall as tokens per expert grow. Counting routes on the CPU for the same table and skew,
+averaged over eight routing draws:
+
+| tokens | routes per expert | dropped | ceil padding | GEMM rows saved |
+|---:|---:|---:|---:|---:|
+| 2048 | 303 | 5.2% | 24.0% | 21.3% |
+| 4096 | 607 | 2.4% | 11.2% | 11.1% |
+| 8192 | 1214 | 1.4% | 5.6% | 5.8% |
+| 16384 | 2427 | 0.7% | 2.8% | 3.0% |
+
+The skew changes which experts lose routes more than how many routes are
+lost. At 4096 tokens with an offset standard deviation of 0.3, where the
+busiest expert gets 2.4 times the mean, nearest rounding dropped 2.6% of
+routes and saved 9.5% of GEMM rows, and no expert lost all of its routes. At
+1.0 the busiest expert gets 5.5 times the mean. There, 11 of the 54 experts
+averaged fewer than 64 routes and lost every route. `dropped_route_fraction`
+barely registers this, because those experts hold few routes. The effect on
+model quality was not measured.
+
+The `y` drop also changed the activation tradeoff. Retaining the activation
+now holds 249.9 MiB per layer after forward, less than the 327.8 MiB the
+recompute default held before. Paired runs on the same inputs, with ceil
+rounding, gave:
+
+| backend | recompute | retain | paired median retain saving | retain faster |
+|---|---:|---:|---:|---:|
+| Triton | 16.058 ms | 15.791 ms | 0.268 ms | 130/150 |
+| CuTe | 14.814 ms | 14.529 ms | 0.295 ms | 143/150 |
+
+Recompute remains the default and holds 78 MiB less per layer. The blocks ran
+one after another, and absolute times drifted by up to 0.5 ms between them.
+Triton recompute with ceil measured 15.594 ms in the first block and
+16.058 ms in this one. Compare times within a row only.
+
+New tests cover the change:
+
+- `test_nearest_token_rounding_matches_reference` checks the output and every
+  gradient against a dense reference that drops the same routes, on both
+  backends at two shapes. Dropped routes must get a zero routing-weight
+  gradient.
+- `test_nearest_rounding_layout` checks which routes are dropped and each
+  expert's row order against a CPU version of the rule. The case has experts
+  that round down and experts that round up.
+- `test_training_step_is_bitwise_reproducible` also runs nearest rounding.
+- `test_route_stats` checks both fractions in both modes. It also checks that
+  asking for them changes no bit of the output or gradients.
