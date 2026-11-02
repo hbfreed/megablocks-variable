@@ -90,6 +90,7 @@ def _inputs(
     seed=0,
     zero_last_weight=False,
     renormalize=False,
+    block_n=128,
 ):
     torch.manual_seed(seed)
     dev = torch.device('cuda')
@@ -116,7 +117,7 @@ def _inputs(
     top_w = top_w0.to(torch.bfloat16).requires_grad_()
 
     dout = torch.randn(num_tokens, hidden, device=dev, dtype=torch.bfloat16)
-    plan = FusedMoEPlan(widths, hidden, dev)
+    plan = FusedMoEPlan(widths, hidden, dev, block_n=block_n)
     return x, top_w, top_e, w_gate, w_up, w_down, dout, plan, scores
 
 
@@ -151,9 +152,10 @@ def _run(
     recompute_activation=True,
     zero_last_weight=False,
     token_rounding='ceil',
+    block_n=128,
 ):
     inputs = _inputs(widths, hidden, top_k, num_tokens, seed, zero_last_weight,
-                     renormalize=token_rounding == 'nearest')
+                     renormalize=token_rounding == 'nearest', block_n=block_n)
     got, grads = _step(inputs, top_k, down_proj_backend, recompute_activation,
                        token_rounding)
 
@@ -528,3 +530,69 @@ def test_unsupported_hidden_raises(hidden):
     top_w = torch.ones(4, device=dev, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match='hidden must be'):
         grouped_moe(x, top_w, top_e, plan, 1, w, w, w.T)
+
+
+@pytest.mark.gpu
+@pytest.mark.world_size(1)
+@pytest.mark.parametrize('down_proj_backend', ['triton', 'cute'])
+def test_runs_on_current_stream(down_proj_backend):
+    # Every kernel must launch on torch's current stream. CuTe used to launch on
+    # the default stream and race the Triton kernels around it.
+    if down_proj_backend == 'cute':
+        _require_cute()
+    top_k = 8
+    inputs = _inputs([128, 256, 384, 512] * 16, 1024, top_k, 1024)
+    want_out, want_grads = _step(inputs, top_k, down_proj_backend)
+    with torch.cuda.stream(torch.cuda.Stream()):
+        for _ in range(8):
+            out, grads = _step(inputs, top_k, down_proj_backend)
+            assert torch.equal(out, want_out)
+            for name, got, want in zip(_GRAD_NAMES, grads, want_grads):
+                assert torch.equal(got, want), f'{name} differs bitwise'
+
+
+@pytest.mark.gpu
+@pytest.mark.world_size(1)
+@pytest.mark.parametrize('down_proj_backend', ['triton', 'cute'])
+@pytest.mark.parametrize(
+    'widths, block_n',
+    [([256, 512, 768, 256], 256), ([512, 1024], 512)],
+)
+def test_width_block_above_128(widths, block_n, down_proj_backend):
+    # Tiles past an expert's width must not run, or their partials corrupt dw_r.
+    if down_proj_backend == 'cute':
+        _require_cute()
+    _assert_close(_run(widths, 1024, 2, 300, down_proj_backend=down_proj_backend,
+                       block_n=block_n))
+
+
+@pytest.mark.gpu
+@pytest.mark.world_size(1)
+@pytest.mark.parametrize('down_proj_backend', ['triton', 'cute'])
+def test_noncontiguous_inputs(down_proj_backend):
+    # Strided x and weights must give what the same data gives in fresh tensors.
+    if down_proj_backend == 'cute':
+        _require_cute()
+    top_k = 2
+    inputs = _inputs([128, 256] * 4, 512, top_k, 100)
+    want_out, want_grads = _step(inputs, top_k, down_proj_backend)
+    x, top_w, top_e, w_gate, w_up, w_down, dout, plan, _ = inputs
+
+    def strided(t):
+        # A leaf holding t's data in every other column, and that view of it.
+        leaf = torch.zeros(t.shape[0], 2 * t.shape[1], dtype=t.dtype, device=t.device)
+        leaf[:, ::2] = t.detach()
+        leaf.requires_grad_()
+        return leaf, leaf[:, ::2]
+
+    leaves, views = zip(*(strided(t) for t in (x, w_gate, w_up, w_down)))
+    assert not any(v.is_contiguous() for v in views)
+    out = grouped_moe(views[0], top_w.flatten(), top_e.flatten().int(), plan, top_k,
+                      views[1], views[2], views[3],
+                      down_proj_backend=down_proj_backend)
+    out.backward(dout)
+    assert torch.equal(out.detach(), want_out)
+    # want_grads is (dx, dw_route, dwg, dwu, dwd).
+    for leaf, want in zip(leaves, (want_grads[0], *want_grads[2:])):
+        assert torch.equal(leaf.grad[:, ::2], want)
+    assert torch.equal(top_w.grad, want_grads[1])

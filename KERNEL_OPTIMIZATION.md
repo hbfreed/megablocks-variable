@@ -667,7 +667,11 @@ The review also fixed or closed:
 - `grouped_moe` now raises for hidden sizes other than 128 or a multiple of 256.
   Those left part of the output or weight gradients unwritten.
 
-Still open, in both this and the previous code: CuTe launches on the default CUDA
-stream and ignores `torch.cuda.stream`, so running inside another stream gave wrong
-results in some runs. `block_n` 256 or 512 with unequal widths gives wrong
-routing-weight gradients. Non-contiguous `x` is silently wrong on Triton.
+Three silent errors that were already in the previous code are also fixed.
+CuTe launched on the default CUDA stream and raced the Triton kernels inside
+`torch.cuda.stream`; it now takes torch's current stream through TVM-FFI's
+environment. `_proj_rows` and `_dgu` ran tiles past an expert's width when
+`block_n` was above 128, which corrupted the routing-weight gradient. Non-contiguous
+inputs were read with computed offsets as if contiguous; they are now made
+contiguous first. `test_runs_on_current_stream`, `test_width_block_above_128`, and
+`test_noncontiguous_inputs` cover them.

@@ -302,7 +302,7 @@ def _proj_rows(
     HIDDEN: tl.constexpr,
     TOTAL_W: tl.constexpr,
     MAX_W: tl.constexpr,
-    NBLOCK_N: tl.constexpr,  # width blocks (128) per BLOCK_N
+    WIDTH_BLOCK: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -313,7 +313,7 @@ def _proj_rows(
     e = tl.load(tile_expert + mt)
     if e < 0:
         return
-    if nt * NBLOCK_N >= tl.load(expert_nblocks + e):
+    if nt * BLOCK_N >= tl.load(expert_nblocks + e) * WIDTH_BLOCK:
         return
 
     rows = mt * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -378,7 +378,7 @@ def _dgu(
     HIDDEN: tl.constexpr,
     MAX_W: tl.constexpr,
     NUM_NT: tl.constexpr,  # dw_part columns: the grid's width-tile count
-    NBLOCK_N: tl.constexpr,
+    WIDTH_BLOCK: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -389,7 +389,7 @@ def _dgu(
     e = tl.load(tile_expert + mt)
     if e < 0:
         return
-    if nt * NBLOCK_N >= tl.load(expert_nblocks + e):
+    if nt * BLOCK_N >= tl.load(expert_nblocks + e) * WIDTH_BLOCK:
         return
 
     rows = mt * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -764,6 +764,13 @@ class _GroupedMoE(torch.autograd.Function):
         route_scores,
         return_route_stats,
     ):
+        # Every kernel addresses these with computed offsets.
+        x, top_weights, expert_ids = (x.contiguous(), top_weights.contiguous(),
+                                      expert_ids.contiguous())
+        w_gate, w_up, w_down = (w_gate.contiguous(), w_up.contiguous(),
+                                w_down.contiguous())
+        if route_scores is not None:
+            route_scores = route_scores.contiguous()
         num_tokens, hidden = x.shape
         num_routes = num_tokens * top_k
         if hidden != plan.hidden_size:
@@ -855,7 +862,7 @@ class _GroupedMoE(torch.autograd.Function):
                     HIDDEN=hidden,
                     TOTAL_W=plan.total_width,
                     MAX_W=plan.max_width,
-                    NBLOCK_N=pn // bn,
+                    WIDTH_BLOCK=bn,
                     BLOCK_M=pm,
                     BLOCK_N=pn,
                     BLOCK_K=pk,
@@ -972,7 +979,7 @@ class _GroupedMoE(torch.autograd.Function):
             HIDDEN=hidden,
             MAX_W=plan.max_width,
             NUM_NT=dgu_nt,
-            NBLOCK_N=gn // bn,
+            WIDTH_BLOCK=bn,
             BLOCK_M=gm,
             BLOCK_N=gn,
             BLOCK_K=gk,

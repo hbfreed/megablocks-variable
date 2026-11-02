@@ -51,9 +51,11 @@ from dataclasses import dataclass
 import torch
 
 try:
+    import cuda.bindings.driver as cuda_driver
     import cutlass
     import cutlass.cute as cute
     import cutlass.utils as utils
+    import tvm_ffi
 except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
     raise ModuleNotFoundError(
         "The CuTe grouped-GEMM experiment needs nvidia-cutlass-dsl>=4.6 "
@@ -94,6 +96,7 @@ class _AmpereRaggedDown:
         expert_nblocks: cute.Tensor,
         expert_row_start: cute.Tensor,
         width_block: cutlass.Constexpr,
+        stream: cuda_driver.CUstream,
     ):
         # Down weights are physically [total_width, hidden], while gate/up
         # weights are [hidden, total_width]. The down projection needs a
@@ -227,7 +230,7 @@ class _AmpereRaggedDown:
             tiled_copy_C,
             tiled_mma,
             width_block,
-        ).launch(grid=grid, block=[self.num_threads, 1, 1])
+        ).launch(grid=grid, block=[self.num_threads, 1, 1], stream=stream)
 
     @cute.kernel
     def kernel(
@@ -734,6 +737,7 @@ class _AmpereGateUpRows(_AmpereRaggedDown):
         expert_col_off: cute.Tensor,
         expert_nblocks: cute.Tensor,
         nblock_n: cutlass.Constexpr,
+        stream: cuda_driver.CUstream,
     ):
         # Gate and up weights are physically [hidden, total_width], the same
         # K-major shape as w_down in the down projection.
@@ -827,6 +831,7 @@ class _AmpereGateUpRows(_AmpereRaggedDown):
                 1,
             ),
             block=[self.num_threads, 1, 1],
+            stream=stream,
         )
 
     @cute.kernel
@@ -1177,6 +1182,22 @@ _GATE_UP_CACHE: dict[tuple, _CompiledKernel] = {}
 _GATE_UP_CFG = (128, 128, 32, 3, (2, 4, 1))
 
 
+# Compiled kernels take their stream from TVM-FFI's environment, not an argument.
+_ENV_STREAM = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+
+def _launch(compiled: _CompiledKernel, *args) -> None:
+    """Launch on torch's current stream, as the Triton kernels do."""
+    # Without a context the environment's stream is the default one. Entering
+    # the context on every launch cost 0.05 ms a step at small shapes, and
+    # torch.cuda.current_stream() 0.02 ms, so read the raw handle as Triton does.
+    if torch._C._cuda_getCurrentRawStream(args[0].device.index) == 0:
+        compiled.fn(*args)
+    else:
+        with tvm_ffi.use_torch_stream():
+            compiled.fn(*args)
+
+
 def _as_cute(
     tensor: torch.Tensor,
     dynamic_dim0: bool = False,
@@ -1234,7 +1255,7 @@ def _compile(
         _as_cute(expert_col_off, dynamic_dim0=True),
     )
     op = _AmpereRaggedDown(atom_layout_mnk=(2, 4, 1))
-    compiled = cute.compile(op, *args, width_block, options="--enable-tvm-ffi")
+    compiled = cute.compile(op, *args, width_block, _ENV_STREAM, options="--enable-tvm-ffi")
     result = _CompiledKernel(compiled, signature)
     _CACHE[signature] = result
     return result
@@ -1283,7 +1304,8 @@ def cute_down_proj(
         expert_nblocks,
         width_block,
     )
-    compiled.fn(
+    _launch(
+        compiled,
         h,
         w_down,
         h,
@@ -1357,11 +1379,12 @@ def cute_dx_proj(
             _as_cute(expert_col_off, dynamic_dim0=True),
         )
         op = _AmpereRaggedDown(atom_layout_mnk=(2, 4, 1), weight_mode="dx")
-        fn = cute.compile(op, *args, width_block, options="--enable-tvm-ffi")
+        fn = cute.compile(op, *args, width_block, _ENV_STREAM, options="--enable-tvm-ffi")
         compiled = _CompiledKernel(fn, signature)
         _DX_CACHE[signature] = compiled
 
-    compiled.fn(
+    _launch(
+        compiled,
         d_rows,
         weight,
         d_rows,
@@ -1444,11 +1467,12 @@ def cute_dx_proj_fused(
             atom_layout_mnk=(2, 4, 1),
             weight_mode="dx_fused",
         )
-        fn = cute.compile(op, *args, width_block, options="--enable-tvm-ffi")
+        fn = cute.compile(op, *args, width_block, _ENV_STREAM, options="--enable-tvm-ffi")
         compiled = _CompiledKernel(fn, signature)
         _DX_FUSED_CACHE[signature] = compiled
 
-    compiled.fn(
+    _launch(
+        compiled,
         dg,
         w_gate,
         du,
@@ -1537,11 +1561,12 @@ def cute_wgrad_rows(
             atom_layout_mnk=(2, 4, 1),
             weight_mode="wgrad",
         )
-        fn = cute.compile(op, *args, k_tile, options="--enable-tvm-ffi")
+        fn = cute.compile(op, *args, k_tile, _ENV_STREAM, options="--enable-tvm-ffi")
         compiled = _CompiledKernel(fn, signature)
         _WGRAD_CACHE[signature] = compiled
 
-    compiled.fn(
+    _launch(
+        compiled,
         a_rows,
         dout,
         route_tokens,
@@ -1630,11 +1655,12 @@ def cute_gate_up_rows(
             _as_cute(expert_nblocks, dynamic_dim0=True),
         )
         op = _AmpereGateUpRows((bm, bn, bk), stages, atom)
-        fn = cute.compile(op, *args, 1, options="--enable-tvm-ffi")
+        fn = cute.compile(op, *args, 1, _ENV_STREAM, options="--enable-tvm-ffi")
         compiled = _CompiledKernel(fn, signature)
         _GATE_UP_CACHE[signature] = compiled
 
-    compiled.fn(
+    _launch(
+        compiled,
         x,
         w_gate,
         w_up,
