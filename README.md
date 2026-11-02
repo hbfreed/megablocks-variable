@@ -13,10 +13,11 @@ inference, and training.
 
 - A fused Triton inference path with device-side counting-sort routing and
   row tiles sized for decode and prefill.
-- A differentiable grouped-MoE training path with deterministic forward and
-  backward kernels and no STK dependency.
+- A differentiable grouped-MoE training path with no STK dependency whose
+  forward and backward are bitwise reproducible from run to run.
 - An optional CuTe DSL backend for the dominant Ampere training GEMMs.
-- Score-aware nearest-block route dropping for reducing training padding.
+- Score-aware nearest-block route dropping for reducing training padding,
+  including `token_rounding='nearest'` in the grouped training path.
 - Extension-free installation for the default Triton paths.
 
 The implementation is intentionally compact. Legacy upstream model layers and
@@ -29,19 +30,15 @@ On an RTX 3090, the fused variable-width serving path improved measured
 keep-50 Qwen3.5-MoE decode throughput from 688 to 1536 tok/s (2.21x) while
 preserving greedy continuations.
 
-For one keep-50 training layer with 4096 tokens, hidden size 2048, and top-k 8,
-150 rotated measurements on the locked Torch 2.12.1 / CUDA 12.6 stack gave:
+For one training layer with 54 experts, 4096 tokens, hidden size 2048, and top-k
+8, on an RTX 3090 at a 275 W limit with the BF16 unlock, under sustained load:
 
 | backend | forward + backward |
 |---|---:|
-| tuned Triton | 16.491 ms |
-| CuTe, recompute activation | 15.626 ms |
-| CuTe, retain activation | **15.264 ms** |
+| Triton | 9.23 ms |
+| CuTe | **8.85 ms** |
 
-The CuTe path with retained activation was 7.1% faster than the final Triton
-path in paired measurements and roughly 10% faster than the pre-optimization
-training implementation. See
-[`KERNEL_OPTIMIZATION.md`](KERNEL_OPTIMIZATION.md) for methodology, rejected
+See [`KERNEL_OPTIMIZATION.md`](KERNEL_OPTIMIZATION.md) for methodology, rejected
 fusions, memory tradeoffs, and shape-specific results.
 
 ## Installation

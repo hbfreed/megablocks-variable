@@ -40,6 +40,20 @@ _COPY_CONFIGS = [
 ]
 
 
+# Expert-major with descending quantized score, so a stable sort ranks each
+# expert's routes by score with ties kept in route order. fp32 score.
+@triton.jit
+def _route_key(
+    expert,
+    score,
+    SCORE_BITS: tl.constexpr,
+    SCORE_SCALE: tl.constexpr,
+):
+    descending = ((1.0 - score) * SCORE_SCALE).to(tl.int32)
+    descending = tl.maximum(0, tl.minimum(descending, SCORE_SCALE))
+    return (expert << SCORE_BITS) | descending
+
+
 @triton.jit
 def _pack_route_keys(
     route_keys,
@@ -54,9 +68,7 @@ def _pack_route_keys(
     mask = offsets < NUM_ROUTES
     expert = tl.load(experts + offsets, mask=mask)
     score = tl.load(scores + offsets, mask=mask).to(tl.float32)
-    descending_score = ((1.0 - score) * SCORE_SCALE).to(tl.int32)
-    descending_score = tl.maximum(0, tl.minimum(descending_score, SCORE_SCALE))
-    key = (expert << SCORE_BITS) | descending_score
+    key = _route_key(expert, score, SCORE_BITS, SCORE_SCALE)
     tl.store(route_keys + offsets, key, mask=mask)
 
 

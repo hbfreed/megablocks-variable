@@ -356,3 +356,357 @@ The backend remains opt-in because CUTLASS DSL is a large optional dependency
 and the implementation currently supports only BF16 Ampere with hidden sizes
 divisible by 256. Install `megablocks[cute]` and pass
 `down_proj_backend="cute"` to `grouped_moe`; Triton remains the default.
+
+## Saved-output removal and stable routing (2026-10-29)
+
+Prime Intellect's
+[Mega MoE training kernels](https://www.primeintellect.ai/blog/prime-mega-moe)
+add a backward to DeepGEMM's fused Mega MoE forward. The kernels are closed
+source, but prime-rl's wrapper shows what autograd keeps: the layer input, the
+routing, and the expert weights. The backward still returns the
+routing-weight gradient. DeepGEMM's public forward multiplies the routing
+weight into the SwiGLU output before the down projection, so its top-k combine
+is an unweighted sum.
+
+The grouped training path now does the same:
+
+- The up projection's SwiGLU epilogue writes `h = w_r * silu(g) * u`. Routing
+  places each `w_r` on its route's padded row. The down projection's output is
+  already weighted, so `_scatter_reduce` sums it unscaled.
+- Backward recovers the routing-weight gradient from the intermediate:
+  `<y_row, dout> = <silu(g) * u, dout @ Wd^T>`. `_dgu` already holds
+  `dout @ Wd^T`, `g`, and `u` in registers. It writes one partial dot per
+  width tile, and `_route_dw` sums each route's partials in tile order.
+  `_route_bwd` now only copies `dout` into the padded rows.
+- The `(rows, hidden)` down-projection output is no longer saved. At the
+  layer shape below it is 155 MiB, twice the optional retained activation.
+
+The measurements below used one RTX 3090 and the locked stack: Torch
+2.12.1+cu130, Triton 3.7.1, and CUTLASS DSL 4.6.3. The layer had hidden size
+2048, 4096 tokens, and top-k 8. The width table was synthetic: 54 experts with
+total width 32768 and widths from 128 to 1024. It is not the served keep50
+table, so absolute times do not compare with the tables above. Memory is the
+allocator delta for one layer:
+
+| one layer | before | after |
+|---|---:|---:|
+| held after forward, recompute activation | 327.8 MiB | 171.9 MiB |
+| held after forward, retain activation | 405.8 MiB | 249.9 MiB |
+| forward + backward peak, recompute activation | 1196.0 MiB | 1041.3 MiB |
+| forward + backward peak, retain activation | 1274.0 MiB | 1119.3 MiB |
+
+Two epilogue details mattered. A 1D row sum in `_dgu` made Triton convert the
+whole fp32 accumulator to the store layout before reducing. ptxas reported
+1012 bytes of epilogue spills on sm_86, against 72 bytes before the change.
+`tl.sum(..., keep_dims=True)` keeps the reduction in the MMA layout and cuts
+the spills to 240 bytes. In the up projection, loading the row weight after
+the `u` store cost 448 bytes of spills. Loading it before the store costs 64
+bytes, against 12 bytes before the change. All of these spills fall after the
+K loop.
+
+Recovering `dw_r` as `rowsum(du * u) / w_r` would avoid the reduction in
+`_dgu`, but it returns 0/0 for zero-weight routes, so it was rejected.
+
+Weight gradients were also not reproducible from run to run, although the
+README described the training path as deterministic. `_scatter_routes` claims
+padded rows with an atomic cursor, so each expert's row order followed atomic
+arrival order. Between identical steps, 92% to 99.7% of routes moved to
+different rows. `out`, `dx`, and the routing-weight gradient are computed per
+row and stayed bitwise stable. `dWg`, `dWu`, and `dWd` sum rows in padded-row
+order and changed on every run. The test configuration enables
+`torch.use_deterministic_algorithms`, which cannot see Triton atomics.
+
+The training path now uses a stable counting sort. `_count_blocks` stores
+each 1024-route block's histogram alongside the per-expert totals.
+`_scatter_routes_stable` adds the earlier blocks' histograms to each expert's
+row start, then sorts its own block on (expert, position). Each expert's
+routes therefore fill its rows in route order. The same kernel writes the
+routing weights, so the routing launch count is unchanged. The serving path
+keeps the atomic permute because its forward is per row.
+
+The stable permute is not slower. It took 10.9 us of GPU time per call against
+12.2 us for the atomic permute at 32768 routes, and 24.7 us against 26.4 us at
+131072 routes. Sorting within a block avoids contention on the expert cursors.
+The whole routing stage, including zeroing the weight buffer, took 19.4 us
+against 19.5 us. A stable `torch.sort` followed by a scatter was also
+deterministic, but it cost about 65 us per layer step in paired measurements,
+roughly the whole saving from dropping `y`.
+
+With both changes, 150 rotated paired forward + backward measurements gave:
+
+| backend | activation | before | after | paired median saving | after faster |
+|---|---|---:|---:|---:|---:|
+| Triton | recompute | 15.659 ms | 15.581 ms | 0.076 ms | 90/150 |
+| Triton | retain | 15.436 ms | 15.385 ms | 0.088 ms | 87/150 |
+| CuTe | recompute | 14.055 ms | 13.940 ms | 0.075 ms | 97/150 |
+| CuTe | retain | 14.129 ms | 14.005 ms | 0.083 ms | 119/150 |
+
+Errors against the dense fp32 reference matched or slightly improved on the
+previous implementation for every gradient. The routing-weight gradient
+improved most, from 3.7e-3 to 7.6e-3 down to 2.6e-3 to 3.5e-3, because it now
+comes from fp32 intermediates instead of the bf16 `y`.
+
+New tests cover the change:
+
+- `test_training_step_is_bitwise_reproducible` fails on the previous
+  implementation (`dWg` differed bitwise) and passes now.
+- `test_routing_layout_is_stable` checks the exact layout, including at twelve
+  routing blocks.
+- `test_zero_routing_weights` covers zero-weight routes, and
+  `test_forward_saves_no_hidden_wide_route_buffer` checks that no
+  `(rows, hidden)` buffer is saved.
+- Every Triton reference case now also runs with the activation retained.
+
+## Token rounding and route statistics (2026-10-29)
+
+Each expert's routes are padded up to whole 128-row tiles, and the padding
+rows go through all three GEMMs, forward and backward. With
+`token_rounding='nearest'`, each expert's route count is instead rounded half
+up to whole tiles. This is the rule gpt_model's `token_rounding='nearest'`
+uses, like SonicMoE's token rounding. An expert that rounds down drops its
+lowest-scoring routes. A dropped route contributes nothing to the output and
+receives no gradient, and the surviving routing weights are not renormalized.
+An expert with fewer than 64 routes in a step therefore kept none of them; since
+2026-11-02 it keeps them all, as described at the end of this file. The numbers
+in this section are from the earlier rule.
+`route_scores` ranks the routes, for example by router probability before
+top-k renormalization, and defaults to `top_weights`. The default, `'ceil'`,
+keeps every route.
+
+In this mode `_count_route_keys` counts each expert's routes and packs each
+route into an int32 key: the expert in the high bits, the quantized score
+(descending) in the low bits. A stable `torch.sort` then ranks each expert's
+routes by score, keeping ties in route order. `_round_counts` computes the
+kept counts. `_scatter_routes_ranked` gives each kept route its row and each
+dropped route row -1, which `_scatter_reduce` and `_route_dw` skip. A dropped
+route has no `route_tokens` entry, so the backward gathers never read its
+`dout`. The layout is a pure function of the inputs, so the step stays bitwise
+reproducible.
+
+`return_route_stats=True` also returns `dropped_route_fraction` and
+`padding_route_fraction`, gpt_model.MoEMLP's names. Both are fractions of all
+routes. `_route_stats` computes them in one program and leaves them on the
+device, so logging them does not synchronize.
+
+The benchmark used the layer above with skewed routing: each expert's router
+logit got a fixed random offset with standard deviation 1.0. Under uniform
+random routing every expert's count lands near the same value, so the
+rounding outcome depends on where that value falls relative to a tile. Here
+nearest rounding dropped 3.10% of the routes. Ceil padding had been 12.5% of
+the routes, and GEMM rows weighted by expert width fell by 13.7%. With card 2
+to itself, 150 rotated pairs per row gave:
+
+| backend | activation | ceil | nearest | paired median saving | nearest faster |
+|---|---|---:|---:|---:|---:|
+| Triton | recompute | 15.594 ms | 13.969 ms | 1.646 ms | 150/150 |
+| Triton | retain | 15.815 ms | 14.076 ms | 1.894 ms | 150/150 |
+| CuTe | recompute | 14.194 ms | 12.712 ms | 1.516 ms | 149/150 |
+| CuTe | retain | 14.310 ms | 12.827 ms | 1.535 ms | 150/150 |
+
+The step was 10.6% to 12.0% faster. That is a little less than the 13.7% row
+reduction, since the rest of the step, routing included, does not shrink.
+
+Ceil pads about half a tile per expert on average. Nearest moves each count
+by about a quarter tile, dropping routes for roughly half of the experts and
+padding the rest. Both shares fall as tokens per expert grow. Counting routes on the CPU for the same table and skew,
+averaged over eight routing draws:
+
+| tokens | routes per expert | dropped | ceil padding | GEMM rows saved |
+|---:|---:|---:|---:|---:|
+| 2048 | 303 | 5.2% | 24.0% | 21.3% |
+| 4096 | 607 | 2.4% | 11.2% | 11.1% |
+| 8192 | 1214 | 1.4% | 5.6% | 5.8% |
+| 16384 | 2427 | 0.7% | 2.8% | 3.0% |
+
+The skew changes which experts lose routes more than how many routes are
+lost. At 4096 tokens with an offset standard deviation of 0.3, where the
+busiest expert gets 2.4 times the mean, nearest rounding dropped 2.6% of
+routes and saved 9.5% of GEMM rows, and no expert lost all of its routes. At
+1.0 the busiest expert gets 5.5 times the mean. There, 11 of the 54 experts
+averaged fewer than 64 routes and lost every route. `dropped_route_fraction`
+barely registers this, because those experts hold few routes. The effect on
+model quality was not measured.
+
+The `y` drop also changed the activation tradeoff. Retaining the activation
+now holds 249.9 MiB per layer after forward, less than the 327.8 MiB the
+recompute default held before. Paired runs on the same inputs, with ceil
+rounding, gave:
+
+| backend | recompute | retain | paired median retain saving | retain faster |
+|---|---:|---:|---:|---:|
+| Triton | 16.058 ms | 15.791 ms | 0.268 ms | 130/150 |
+| CuTe | 14.814 ms | 14.529 ms | 0.295 ms | 143/150 |
+
+Recompute remains the default and holds 78 MiB less per layer. The blocks ran
+one after another, and absolute times drifted by up to 0.5 ms between them.
+Triton recompute with ceil measured 15.594 ms in the first block and
+16.058 ms in this one. Compare times within a row only.
+
+New tests cover the change:
+
+- `test_nearest_token_rounding_matches_reference` checks the output and every
+  gradient against a dense reference that drops the same routes, on both
+  backends at two shapes. Dropped routes must get a zero routing-weight
+  gradient.
+- `test_nearest_rounding_layout` checks which routes are dropped and each
+  expert's row order against a CPU version of the rule. The case has experts
+  that round down and experts that round up.
+- `test_training_step_is_bitwise_reproducible` also runs nearest rounding.
+- `test_route_stats` checks both fractions in both modes. It also checks that
+  asking for them changes no bit of the output or gradients.
+
+## Grid order, load alignment, and a fused CuTe projection (2026-11-01)
+
+These measurements ran with the BF16 unlock active (full tensor-core rate, 0.084
+TF/MHz) and a 275 W limit, the efficiency knee of the unlocked power sweep. Under
+that limit the core clock settles near 1450 MHz on this step, so a step's budget
+is energy, and removing work raises the clock. Rotating single steps shares one
+clock between the two versions and understates that effect, so every number
+below comes from alternating multi-second blocks, dropping each block's first
+second. Comparing a tree with itself moved these numbers by at most about 0.1 ms.
+
+The layer is the one from the previous sections, with moderately balanced routing.
+Against the previous commit, on one card:
+
+| backend | before | after | faster | blocks won |
+|---|---:|---:|---:|---:|
+| CuTe | 11.60 ms | **8.85 ms** | 23.7% | 6/6 |
+| Triton | 12.88 ms | **9.23 ms** | 28.3% | 6/6 |
+
+Swapping the two trees flipped the sign of the saving. Peak memory for the layer
+fell from 1041 to 885 MiB. Output and all gradients stayed bitwise identical on
+all five benchmark shapes, in both backends, with the activation retained or
+recomputed, and with either rounding mode. Other cases, in shorter runs:
+
+| case | CuTe | Triton |
+|---|---:|---:|
+| lopsided routing | 11.47 -> 8.63 ms | 12.70 -> 9.03 ms |
+| 1024 tokens | 4.36 -> 3.37 ms | 4.85 -> 3.59 ms |
+| 80 narrow experts, hidden 1024, top-k 6 | 3.27 -> 2.56 ms | 3.63 -> 2.64 ms |
+| 220 experts, widths 128 to 512 | 9.56 -> 7.09 ms | 10.50 -> 7.65 ms |
+| activation retained | 11.59 -> 8.62 ms | 12.69 -> 9.10 ms |
+| `token_rounding='nearest'` | 11.02 -> 8.35 ms | 12.13 -> 8.74 ms |
+
+The changes, in the order they were stacked:
+
+- **Grid order, 8.0% on both backends.** `program_id(0)` advances fastest, so it
+  sets which CTAs run side by side. With the row tile there, the GPU swept every
+  row tile for one width slice, then re-read the same rows for the next slice.
+  Putting the width or hidden tile there lets a row tile's CTAs share its rows
+  through L2. Memory utilization fell from about 64% to 50%, and the saved power
+  raised the clock by about 100 MHz. `_wgrad_gather` already had this order.
+  Reversing it costs 12%. Triton `_down_proj` keeps the old order because it is
+  shared with serving and the swap made no difference there.
+- **`_wgrad_gather` tile, 3.3% and 3.0%.** 128x128x32 with three stages replaces
+  128x64x32 with two.
+- **Weight-gradient K loops stop at the route count, 1.4% and 1.7%, over 4% at
+  1024 tokens.** They ran to the padded count, multiplying exact zeros. They now
+  stop at the count rounded up to the K tile.
+- **Load alignment and orientation.** Triton sizes a load from the alignment it
+  can prove, and a loaded `expert_col_off` has none. An operand indexed by it along
+  its contiguous axis dropped to one `LDG` per bf16 with no `cp.async`. Offsets
+  are multiples of the width block, so `(off >> 3) << 3` changes no value and
+  proves the 16 bytes `cp.async` needs. A masked load followed by `tl.trans` also
+  stays in registers on blocking loads, so the weight-gradient kernels now load in
+  MMA orientation.
+- **Fused CuTe gate and up.** `cute_gate_up_rows` replaces two `_proj_rows`
+  launches on the CuTe backend and reads x once. Measured alone it saved 0.71 ms.
+  The same fusion in Triton lost 0.13 ms, measured before the alignment fix.
+- **`h` written by `_dgu`.** `_silu_mul` walked the whole padded buffer. Writing
+  `h` in `_dgu` touches only real tiles and removes a launch, saving about 0.15 ms
+  when measured alone.
+
+The previous four items together took CuTe from 10.27 to 8.99 ms and Triton from
+11.37 to 9.67 ms.
+
+- **`dy_rows` removed, 1.8% and 1.5%, and 156 MiB.** `_dgu` and the dWd kernels
+  gather `dout` through `route_tokens`, as `_proj_rows` gathers x. `_route_bwd` and
+  `_zero_pad_rows` are gone.
+- **Triton tiles, 2.3% on Triton.** The gate projection now uses K32, and
+  `_dx_rows_fused` three stages.
+
+The 250 W to 275 W change alone had taken the CuTe step from about 14.3 to 12.0 ms,
+though that comparison was not paired. `_scatter_reduce` and `_route_bwd` did not
+change with power at all, which marks them as limited by DRAM alone.
+
+Measured and rejected, all at 275 W:
+
+- `_ROW_BLOCK` 64 was 8.2% slower on Triton.
+- Skipping MMAs on all-padding warps in CuTe saved 0.00 ms.
+- Fusing dWg and dWu in Triton lost up to 0.21 ms in single-accumulator forms. A
+  3D grid with a stream axis gained only 0.07 ms.
+- 16 warps in the fused CuTe projection gained 0.04 ms, against 0.61 ms for 8.
+- A device-built table of live (tile, width tile) CTA pairs gained 0.02 ms on Triton
+  and lost 0.05 ms with 80 narrow experts.
+- Not storing padding rows of `dx_rows` made no difference on top of this stack.
+- A K32, three-stage CuTe wgrad returned wrong, unreproducible dWd for experts
+  with few routes. The pipeline's prologue committed a `cp.async` group only for
+  K tiles it copied, so with too few tiles `wait_group(stages - 2)` passed while one
+  was still in flight. It now always commits, which made K32 bitwise correct, but
+  K32 then gained only 0.02 ms, so the kernel stays at K64 with two stages.
+
+Measured on an earlier stack and not ported: a CuTe `_dgu` (0.20 ms), interleaving
+the two CuTe dx streams (0.08 ms), fusing small launches (0.07 ms), and L2 hints
+(0.08 ms). Two-level row tiles were still mixed, from -0.17 to +0.18 ms, when the
+work stopped. A CuTe dWg/dWu saved 0.50 ms before the alignment fix, which gave
+the Triton kernel about the same gain, and it was not measured again after it.
+
+Finite results stayed bitwise identical on every supported input the review tried:
+route counts around each tile boundary, a single expert, one token, top-k from 1 to
+the expert count, hidden sizes from 256 to 2048, NaN-filled fresh buffers, and
+alternating plans. Non-finite inputs can differ. An Inf in `dout` can give NaN in
+dWd on CuTe, where it gave Inf, because a padding row multiplies the stale
+contents of its K-tile slot by zero. An Inf in the weights can give Inf where it
+gave NaN, because the weight-gradient K loops no longer multiply it by padding.
+
+The review also fixed or closed:
+
+- The `cp.async` commit above was already wrong for any expert with too few K tiles.
+  A 32-wide expert under `block_n=32` returned 32% error on the CuTe down
+  projection before this change. `test_cute_short_k_loop` covers it.
+- A one-row view of a wider tensor is contiguous but keeps its parent's stride, and
+  compiling a CuTe kernel on one raised an error. `test_cute_one_row_view` covers it.
+- `grouped_moe` now raises for hidden sizes other than 128 or a multiple of 256.
+  Those left part of the output or weight gradients unwritten.
+
+Three silent errors that were already in the previous code are also fixed.
+CuTe launched on the default CUDA stream and raced the Triton kernels inside
+`torch.cuda.stream`; it now takes torch's current stream through TVM-FFI's
+environment. `_proj_rows` and `_dgu` ran tiles past an expert's width when
+`block_n` was above 128, which corrupted the routing-weight gradient. Non-contiguous
+inputs were read with computed offsets as if contiguous; they are now made
+contiguous first. `test_runs_on_current_stream`, `test_width_block_above_128`, and
+`test_noncontiguous_inputs` cover them.
+
+An independent review of the routing and token-rounding code led to three more
+changes:
+
+- **`nearest` no longer rounds an expert with routes down to zero.** Under the
+  earlier rule, an expert under 64 routes stopped training for the step, and with
+  every expert under 64 the whole layer returned zeros with no error. This departs
+  from `gpt_model`, which raises in the all-zero case, because raising would need a
+  host read. Counting routes on the CPU, averaged over eight routing draws:
+
+  | offset sd | tokens | dropped | GEMM rows saved | experts silenced |
+  |---:|---:|---:|---:|---:|
+  | 0.3 | 1024 | 7.3% | 22.3% | 0 |
+  | 0.3 | 4096 | 2.6% | 9.5% | 0 |
+  | 1.0 | 1024 | 4.1% | 12.6% | 0 |
+  | 1.0 | 4096 | 1.7% | 6.7% | 0 |
+
+  At an offset of 1.0 and 4096 tokens the earlier rule saved 11.1% of GEMM rows and
+  silenced 11 of 54 experts. The difference is the padding those experts now keep.
+- **The routing prefix is one scan.** Each permute program summed every earlier
+  block's histogram, which is quadratic in routes. `_plan_tiles_scan` now scans the
+  table once in the existing planning launch, and each program reads two rows.
+  Whole-routing GPU time, 54 experts:
+
+  | routes | before | after |
+  |---:|---:|---:|
+  | 32768 | 19.3 us | 19.9 us |
+  | 131072 | 37.9 us | 42.4 us |
+  | 1048576 | 369.4 us | 260.6 us |
+
+  The sustained step did not change at the benchmark shapes.
+- **`kernels._route_key` holds the packed key encoding**, which `_pack_route_keys`
+  and `_count_route_keys` had each copied.
