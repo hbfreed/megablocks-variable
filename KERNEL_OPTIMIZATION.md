@@ -450,8 +450,8 @@ New tests cover the change:
 
 - `test_training_step_is_bitwise_reproducible` fails on the previous
   implementation (`dWg` differed bitwise) and passes now.
-- `test_routing_layout_is_stable` checks the exact layout, including the
-  chunked prefix sum at twelve blocks.
+- `test_routing_layout_is_stable` checks the exact layout, including at twelve
+  routing blocks.
 - `test_zero_routing_weights` covers zero-weight routes, and
   `test_forward_saves_no_hidden_wide_route_buffer` checks that no
   `(rows, hidden)` buffer is saved.
@@ -466,7 +466,9 @@ up to whole tiles. This is the rule gpt_model's `token_rounding='nearest'`
 uses, like SonicMoE's token rounding. An expert that rounds down drops its
 lowest-scoring routes. A dropped route contributes nothing to the output and
 receives no gradient, and the surviving routing weights are not renormalized.
-An expert with fewer than 64 routes in a step therefore keeps none of them.
+An expert with fewer than 64 routes in a step therefore kept none of them; since
+2026-11-02 it keeps them all, as described at the end of this file. The numbers
+in this section are from the earlier rule.
 `route_scores` ranks the routes, for example by router probability before
 top-k renormalization, and defaults to `top_weights`. The default, `'ceil'`,
 keeps every route.
@@ -675,3 +677,36 @@ environment. `_proj_rows` and `_dgu` ran tiles past an expert's width when
 inputs were read with computed offsets as if contiguous; they are now made
 contiguous first. `test_runs_on_current_stream`, `test_width_block_above_128`, and
 `test_noncontiguous_inputs` cover them.
+
+An independent review of the routing and token-rounding code led to three more
+changes:
+
+- **`nearest` no longer rounds an expert with routes down to zero.** Under the
+  earlier rule, an expert under 64 routes stopped training for the step, and with
+  every expert under 64 the whole layer returned zeros with no error. This departs
+  from `gpt_model`, which raises in the all-zero case, because raising would need a
+  host read. Counting routes on the CPU, averaged over eight routing draws:
+
+  | offset sd | tokens | dropped | GEMM rows saved | experts silenced |
+  |---:|---:|---:|---:|---:|
+  | 0.3 | 1024 | 7.3% | 22.3% | 0 |
+  | 0.3 | 4096 | 2.6% | 9.5% | 0 |
+  | 1.0 | 1024 | 4.1% | 12.6% | 0 |
+  | 1.0 | 4096 | 1.7% | 6.7% | 0 |
+
+  At an offset of 1.0 and 4096 tokens the earlier rule saved 11.1% of GEMM rows and
+  silenced 11 of 54 experts. The difference is the padding those experts now keep.
+- **The routing prefix is one scan.** Each permute program summed every earlier
+  block's histogram, which is quadratic in routes. `_plan_tiles_scan` now scans the
+  table once in the existing planning launch, and each program reads two rows.
+  Whole-routing GPU time, 54 experts:
+
+  | routes | before | after |
+  |---:|---:|---:|
+  | 32768 | 19.3 us | 19.9 us |
+  | 131072 | 37.9 us | 42.4 us |
+  | 1048576 | 369.4 us | 260.6 us |
+
+  The sustained step did not change at the benchmark shapes.
+- **`kernels._route_key` holds the packed key encoding**, which `_pack_route_keys`
+  and `_count_route_keys` had each copied.

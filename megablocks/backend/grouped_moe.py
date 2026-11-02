@@ -126,13 +126,46 @@ def _count_blocks(
     tl.atomic_add(counts + bins, local, mask=bins < NUM_EXPERTS)
 
 
+# _plan_tiles, plus one exclusive scan of block_hist along the blocks, in place:
+# row b becomes the routes to each bin in blocks before b, and a final row holds
+# the totals, so row b + 1 - row b is still block b's own histogram. Scanning here
+# adds no launch, and each permute program then reads two rows however many blocks
+# there are. Integer sums, so the table is deterministic.
+@triton.jit
+def _plan_tiles_scan(
+    counts,
+    expert_row_start,
+    cursor,
+    tile_expert,
+    route_tokens,
+    block_hist,
+    mtile_bound,  # runtime, not constexpr -- see fused_moe._plan_tiles
+    route_blocks,  # runtime for the same reason
+    NUM_EXPERTS: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    FILL: tl.constexpr,
+    BINS: tl.constexpr,
+):
+    _plan_tiles(counts, expert_row_start, cursor, tile_expert, route_tokens,
+                mtile_bound, NUM_EXPERTS, BLOCK_E, BLOCK_M, FILL)
+    bins = tl.arange(0, BINS)
+    earlier = tl.zeros((BINS,), dtype=tl.int32)
+    for b in range(route_blocks):
+        row = block_hist + b * BINS + bins
+        hist = tl.load(row)
+        tl.store(row, earlier)
+        earlier += hist
+    tl.store(block_hist + route_blocks * BINS + bins, earlier)
+
+
 # The permute step of the counting sort, made stable: a route's rank within its
 # expert is the number of earlier routes to that expert, so the padded layout
 # -- and with it the summation order of every weight-gradient K loop -- is a
 # pure function of expert_ids. fused_moe._scatter_routes claims rows with an
 # atomic cursor, which is fine for inference, where rows are independent, but
 # made dW differ bitwise between identical training steps. Earlier blocks
-# contribute through their histograms; within the block, sorting on
+# contribute through _plan_tiles_scan's table; within the block, sorting on
 # (expert, position) orders each expert's routes. Each route's weight goes onto
 # its row; row_w is zero-initialized, so padding rows weigh 0.
 @triton.jit
@@ -149,19 +182,11 @@ def _scatter_routes_stable(
     BINS: tl.constexpr,
     TOP_K: tl.constexpr,
     BLOCK: tl.constexpr,
-    PREFIX_BLOCKS: tl.constexpr,
 ):
     b = tl.program_id(0)
     bins = tl.arange(0, BINS)
-    earlier = tl.zeros((BINS,), dtype=tl.int32)
-    for b0 in range(0, b, PREFIX_BLOCKS):
-        prev = b0 + tl.arange(0, PREFIX_BLOCKS)
-        earlier += tl.sum(
-            tl.load(block_hist + prev[:, None] * BINS + bins[None, :],
-                    mask=(prev < b)[:, None], other=0),
-            axis=0,
-        )
-    hist = tl.load(block_hist + b * BINS + bins)
+    earlier = tl.load(block_hist + b * BINS + bins)
+    hist = tl.load(block_hist + (b + 1) * BINS + bins) - earlier
     # Sorted position p of expert e's routes in this block is row base[e] + p.
     base = (tl.load(expert_row_start + bins, mask=bins < NUM_EXPERTS, other=0)
             + earlier - (tl.cumsum(hist, 0) - hist))
@@ -181,10 +206,9 @@ def _scatter_routes_stable(
 
 # Nearest token rounding, opt-in: each expert keeps its route count rounded
 # half up to whole row tiles, dropping its lowest-scoring routes when that
-# rounds down. This is gpt_model's token_rounding='nearest' (and SonicMoE's
-# token rounding). The keys match kernels._pack_route_keys -- expert-major,
-# descending quantized score -- so a stable sort ranks each expert's routes
-# with ties kept in route order. Also accumulates the per-expert totals.
+# rounds down, but never rounding down to zero. Otherwise this is gpt_model's
+# token_rounding='nearest' (and SonicMoE's token rounding). The keys are
+# kernels._route_key's. Also accumulates the per-expert totals.
 @triton.jit
 def _count_route_keys(
     expert_ids,
@@ -204,15 +228,17 @@ def _count_route_keys(
     bins = tl.arange(0, BINS)
     tl.atomic_add(counts + bins, tl.histogram(e, BINS), mask=bins < NUM_EXPERTS)
     score = tl.load(scores + off, mask=m, other=0.0).to(tl.float32)
-    descending = ((1.0 - score) * SCORE_SCALE).to(tl.int32)
-    descending = tl.maximum(0, tl.minimum(descending, SCORE_SCALE))
-    tl.store(route_keys + off, (e << SCORE_BITS) | descending, mask=m)
+    tl.store(route_keys + off, kernels._route_key(e, score, SCORE_BITS, SCORE_SCALE),
+             mask=m)
 
 
 # One program: where each expert's routes start in the sorted keys, and how
 # many of them it keeps -- min(count, count rounded half up to BLOCK_M), as in
-# gpt_model's _block_tokens_per_expert. _plan_tiles then plans the kept counts;
-# the original counts go to routed_counts for _route_stats.
+# gpt_model's _block_tokens_per_expert, except that an expert under half a tile
+# keeps its routes. Rounding those to zero stops the expert training for the step,
+# and at small batches zeroes the whole layer, with no sign short of a host read.
+# _plan_tiles then plans the kept counts; the original counts go to routed_counts
+# for _route_stats.
 @triton.jit
 def _round_counts(
     counts,
@@ -227,7 +253,7 @@ def _round_counts(
     n = tl.load(counts + e, mask=live, other=0)
     tl.store(routed_counts + e, n, mask=live)
     tl.store(sorted_start + e, tl.cumsum(n, 0) - n, mask=live)
-    rounded = (n + BLOCK_M // 2) // BLOCK_M * BLOCK_M
+    rounded = tl.maximum((n + BLOCK_M // 2) // BLOCK_M * BLOCK_M, BLOCK_M)
     tl.store(counts + e, tl.minimum(n, rounded), mask=live)
 
 
@@ -612,8 +638,8 @@ def _route(expert_ids, top_weights, plan, top_k, m_tiles, row_bound,
     route's padded row (-1 if dropped), and each padded row's routing weight
     (0 for padding). token_rounding='ceil' keeps every route, in route order
     within its expert. 'nearest' keeps each expert's count rounded half up to
-    whole row tiles, highest route_scores first (top_weights when route_scores
-    is None). Either layout is a pure function of the inputs. Leaves this
+    whole row tiles, but at least one tile's worth, highest route_scores first
+    (top_weights when route_scores is None). Either layout is a pure function of the inputs. Leaves this
     call's kept counts in plan.counts and row starts in plan.expert_row_start.
     A float32 (2,) `stats` receives the dropped-route and padding-row
     fractions (see _route_stats).
@@ -627,7 +653,7 @@ def _route(expert_ids, top_weights, plan, top_k, m_tiles, row_bound,
     route_blocks = triton.cdiv(num_routes, _ROUTE_BLOCK)
     plan.counts.zero_()
     if token_rounding == 'ceil':
-        block_hist = torch.empty((route_blocks, plan.count_bins),
+        block_hist = torch.empty((route_blocks + 1, plan.count_bins),
                                  dtype=torch.int32, device=dev)
         _count_blocks[(route_blocks,)](
             expert_ids,
@@ -668,19 +694,37 @@ def _route(expert_ids, top_weights, plan, top_k, m_tiles, row_bound,
             BLOCK_M=_ROW_BLOCK,
             num_warps=4,
         )
-    _plan_tiles[(1,)](
-        plan.counts,
-        plan.expert_row_start,
-        plan.cursor,
-        tile_expert,
-        route_tokens,
-        m_tiles,
-        NUM_EXPERTS=plan.num_experts,
-        BLOCK_E=plan.block_e,
-        BLOCK_M=_ROW_BLOCK,
-        FILL=1024,
-        num_warps=4,
-    )
+    if token_rounding == 'ceil':
+        _plan_tiles_scan[(1,)](
+            plan.counts,
+            plan.expert_row_start,
+            plan.cursor,
+            tile_expert,
+            route_tokens,
+            block_hist,
+            m_tiles,
+            route_blocks,
+            NUM_EXPERTS=plan.num_experts,
+            BLOCK_E=plan.block_e,
+            BLOCK_M=_ROW_BLOCK,
+            FILL=1024,
+            BINS=plan.count_bins,
+            num_warps=4,
+        )
+    else:
+        _plan_tiles[(1,)](
+            plan.counts,
+            plan.expert_row_start,
+            plan.cursor,
+            tile_expert,
+            route_tokens,
+            m_tiles,
+            NUM_EXPERTS=plan.num_experts,
+            BLOCK_E=plan.block_e,
+            BLOCK_M=_ROW_BLOCK,
+            FILL=1024,
+            num_warps=4,
+        )
     row_w = torch.zeros(row_bound, dtype=torch.float32, device=dev)
     if token_rounding == 'ceil':
         _scatter_routes_stable[(route_blocks,)](
@@ -696,7 +740,6 @@ def _route(expert_ids, top_weights, plan, top_k, m_tiles, row_bound,
             BINS=plan.count_bins,
             TOP_K=top_k,
             BLOCK=_ROUTE_BLOCK,
-            PREFIX_BLOCKS=8,
             num_warps=4,
         )
     else:
@@ -1140,8 +1183,9 @@ def grouped_moe(
     ``token_rounding='nearest'`` rounds each expert's route count half up to
     whole 128-row tiles, like gpt_model's ``token_rounding='nearest'``: an
     expert that rounds down drops its lowest-scoring routes, which then
-    contribute nothing and receive no gradient. The surviving weights are not
-    renormalized. ``route_scores`` (flattened like ``top_weights``, in [0, 1],
+    contribute nothing and receive no gradient. Unlike gpt_model, an expert with
+    routes never rounds down to zero, so an expert under 64 routes keeps them
+    all. The surviving weights are not renormalized. ``route_scores`` (flattened like ``top_weights``, in [0, 1],
     e.g. the router probabilities before top-k renormalization) ranks the
     routes; it defaults to ``top_weights``. The default ``'ceil'`` keeps every
     route and pads each expert to whole tiles instead.

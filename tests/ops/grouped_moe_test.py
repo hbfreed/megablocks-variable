@@ -64,8 +64,9 @@ def _nearest_rounding(top_e, scores, num_experts):
     """(keep, rank) under nearest token rounding, by the kernels' own rule.
 
     Keys are expert-major with descending quantized score, as in
-    kernels._pack_route_keys; a stable sort ranks each expert's routes, and an
-    expert keeps min(count, count rounded half up to the row tile) of them.
+    kernels._route_key; a stable sort ranks each expert's routes, and an expert
+    keeps min(count, count rounded half up to the row tile, but at least one
+    tile) of them.
     """
     block = grouped_moe_module._ROW_BLOCK
     bits = grouped_moe_module._route_score_bits(num_experts)
@@ -75,7 +76,8 @@ def _nearest_rounding(top_e, scores, num_experts):
     keys = (e << bits) | descending.clamp(0, scale).long()
     order = torch.sort(keys, stable=True).indices
     counts = torch.bincount(e, minlength=num_experts)
-    kept = torch.minimum(counts, (counts + block // 2) // block * block)
+    rounded = ((counts + block // 2) // block * block).clamp_min(block)
+    kept = torch.minimum(counts, rounded)
     start = torch.cumsum(counts, 0) - counts
     rank = torch.empty_like(e)
     rank[order] = torch.arange(e.numel()) - start[e[order]]
@@ -319,7 +321,9 @@ def test_unaligned_dout(down_proj_backend):
     [
         ([128] * 8, 2, 5),
         ([128, 256, 384, 512] * 16, 6, 200),    # two routing blocks
-        ([128, 256, 384, 512] * 16, 8, 1500),   # twelve: chunked prefix sum
+        ([128] * 8, 8, 128),                    # exactly one routing block
+        ([128, 256, 384, 512] * 16, 8, 1024),   # exactly eight
+        ([128, 256, 384, 512] * 16, 8, 1500),   # twelve
         ([128, 256, 384, 512] * 55, 8, 4096),   # 32 blocks, 220 experts
     ],
 )
@@ -596,3 +600,27 @@ def test_noncontiguous_inputs(down_proj_backend):
     for leaf, want in zip(leaves, (want_grads[0], *want_grads[2:])):
         assert torch.equal(leaf.grad[:, ::2], want)
     assert torch.equal(top_w.grad, want_grads[1])
+
+
+@pytest.mark.gpu
+@pytest.mark.world_size(1)
+@pytest.mark.parametrize(
+    'widths, hidden, top_k, num_tokens',
+    [
+        ([128, 256, 384, 512] * 55, 256, 2, 100),  # every expert under half a tile
+        ([128, 256] * 4, 256, 2, 100),             # some under, some over
+    ],
+)
+def test_nearest_keeps_experts_under_half_a_tile(widths, hidden, top_k, num_tokens):
+    # Rounding them to zero stopped those experts training for the step, and with
+    # every expert under half a tile zeroed the whole layer without any error.
+    inputs = _inputs(widths, hidden, top_k, num_tokens, renormalize=True)
+    x, top_w, top_e, w_gate, w_up, w_down, _, plan, scores = inputs
+    out, stats = grouped_moe(x, top_w.flatten(), top_e.flatten().int(), plan, top_k,
+                             w_gate, w_up, w_down, token_rounding='nearest',
+                             route_scores=scores.flatten(), return_route_stats=True)
+    assert bool((out != 0).any())
+    counts = torch.bincount(top_e.flatten(), minlength=len(widths))
+    if int(counts.max()) < 64:
+        assert stats['dropped_route_fraction'].item() == 0.0
+    _assert_close(_run(widths, hidden, top_k, num_tokens, token_rounding='nearest'))
