@@ -476,8 +476,9 @@ route into an int32 key: the expert in the high bits, the quantized score
 (descending) in the low bits. A stable `torch.sort` then ranks each expert's
 routes by score, keeping ties in route order. `_round_counts` computes the
 kept counts. `_scatter_routes_ranked` gives each kept route its row and each
-dropped route row -1, which `_scatter_reduce`, `_route_bwd`, and `_route_dw`
-skip. The layout is a pure function of the inputs, so the step stays bitwise
+dropped route row -1, which `_scatter_reduce` and `_route_dw` skip. A dropped
+route has no `route_tokens` entry, so the backward gathers never read its
+`dout`. The layout is a pure function of the inputs, so the step stays bitwise
 reproducible.
 
 `return_route_stats=True` also returns `dropped_route_fraction` and
@@ -551,3 +552,122 @@ New tests cover the change:
 - `test_training_step_is_bitwise_reproducible` also runs nearest rounding.
 - `test_route_stats` checks both fractions in both modes. It also checks that
   asking for them changes no bit of the output or gradients.
+
+## Grid order, load alignment, and a fused CuTe projection (2026-11-01)
+
+These measurements ran with the BF16 unlock active (full tensor-core rate, 0.084
+TF/MHz) and a 275 W limit, the efficiency knee of the unlocked power sweep. Under
+that limit the core clock settles near 1450 MHz on this step, so a step's budget
+is energy, and removing work raises the clock. Rotating single steps shares one
+clock between the two versions and understates that effect, so every number
+below comes from alternating multi-second blocks, dropping each block's first
+second. Comparing a tree with itself moved these numbers by at most about 0.1 ms.
+
+The layer is the one from the previous sections, with moderately balanced routing.
+Against the previous commit, on one card:
+
+| backend | before | after | faster | blocks won |
+|---|---:|---:|---:|---:|
+| CuTe | 11.60 ms | **8.85 ms** | 23.7% | 6/6 |
+| Triton | 12.88 ms | **9.23 ms** | 28.3% | 6/6 |
+
+Swapping the two trees flipped the sign of the saving. Peak memory for the layer
+fell from 1041 to 885 MiB. Output and all gradients stayed bitwise identical on
+all five benchmark shapes, in both backends, with the activation retained or
+recomputed, and with either rounding mode. Other cases, in shorter runs:
+
+| case | CuTe | Triton |
+|---|---:|---:|
+| lopsided routing | 11.47 -> 8.63 ms | 12.70 -> 9.03 ms |
+| 1024 tokens | 4.36 -> 3.37 ms | 4.85 -> 3.59 ms |
+| 80 narrow experts, hidden 1024, top-k 6 | 3.27 -> 2.56 ms | 3.63 -> 2.64 ms |
+| 220 experts, widths 128 to 512 | 9.56 -> 7.09 ms | 10.50 -> 7.65 ms |
+| activation retained | 11.59 -> 8.62 ms | 12.69 -> 9.10 ms |
+| `token_rounding='nearest'` | 11.02 -> 8.35 ms | 12.13 -> 8.74 ms |
+
+The changes, in the order they were stacked:
+
+- **Grid order, 8.0% on both backends.** `program_id(0)` advances fastest, so it
+  sets which CTAs run side by side. With the row tile there, the GPU swept every
+  row tile for one width slice, then re-read the same rows for the next slice.
+  Putting the width or hidden tile there lets a row tile's CTAs share its rows
+  through L2. Memory utilization fell from about 64% to 50%, and the saved power
+  raised the clock by about 100 MHz. `_wgrad_gather` already had this order.
+  Reversing it costs 12%. Triton `_down_proj` keeps the old order because it is
+  shared with serving and the swap made no difference there.
+- **`_wgrad_gather` tile, 3.3% and 3.0%.** 128x128x32 with three stages replaces
+  128x64x32 with two.
+- **Weight-gradient K loops stop at the route count, 1.4% and 1.7%, over 4% at
+  1024 tokens.** They ran to the padded count, multiplying exact zeros. They now
+  stop at the count rounded up to the K tile.
+- **Load alignment and orientation.** Triton sizes a load from the alignment it
+  can prove, and a loaded `expert_col_off` has none. An operand indexed by it along
+  its contiguous axis dropped to one `LDG` per bf16 with no `cp.async`. Offsets
+  are multiples of the width block, so `(off >> 3) << 3` changes no value and
+  proves the 16 bytes `cp.async` needs. A masked load followed by `tl.trans` also
+  stays in registers on blocking loads, so the weight-gradient kernels now load in
+  MMA orientation.
+- **Fused CuTe gate and up.** `cute_gate_up_rows` replaces two `_proj_rows`
+  launches on the CuTe backend and reads x once. Measured alone it saved 0.71 ms.
+  The same fusion in Triton lost 0.13 ms, measured before the alignment fix.
+- **`h` written by `_dgu`.** `_silu_mul` walked the whole padded buffer. Writing
+  `h` in `_dgu` touches only real tiles and removes a launch, saving about 0.15 ms
+  when measured alone.
+
+The previous four items together took CuTe from 10.27 to 8.99 ms and Triton from
+11.37 to 9.67 ms.
+
+- **`dy_rows` removed, 1.8% and 1.5%, and 156 MiB.** `_dgu` and the dWd kernels
+  gather `dout` through `route_tokens`, as `_proj_rows` gathers x. `_route_bwd` and
+  `_zero_pad_rows` are gone.
+- **Triton tiles, 2.3% on Triton.** The gate projection now uses K32, and
+  `_dx_rows_fused` three stages.
+
+The 250 W to 275 W change alone had taken the CuTe step from about 14.3 to 12.0 ms,
+though that comparison was not paired. `_scatter_reduce` and `_route_bwd` did not
+change with power at all, which marks them as limited by DRAM alone.
+
+Measured and rejected, all at 275 W:
+
+- `_ROW_BLOCK` 64 was 8.2% slower on Triton.
+- Skipping MMAs on all-padding warps in CuTe saved 0.00 ms.
+- Fusing dWg and dWu in Triton lost up to 0.21 ms in single-accumulator forms. A
+  3D grid with a stream axis gained only 0.07 ms.
+- 16 warps in the fused CuTe projection gained 0.04 ms, against 0.61 ms for 8.
+- A device-built table of live (tile, width tile) CTA pairs gained 0.02 ms on Triton
+  and lost 0.05 ms with 80 narrow experts.
+- Not storing padding rows of `dx_rows` made no difference on top of this stack.
+- A K32, three-stage CuTe wgrad returned wrong, unreproducible dWd for experts
+  with few routes. The pipeline's prologue committed a `cp.async` group only for
+  K tiles it copied, so with too few tiles `wait_group(stages - 2)` passed while one
+  was still in flight. It now always commits, which made K32 bitwise correct, but
+  K32 then gained only 0.02 ms, so the kernel stays at K64 with two stages.
+
+Measured on an earlier stack and not ported: a CuTe `_dgu` (0.20 ms), interleaving
+the two CuTe dx streams (0.08 ms), fusing small launches (0.07 ms), and L2 hints
+(0.08 ms). Two-level row tiles were still mixed, from -0.17 to +0.18 ms, when the
+work stopped. A CuTe dWg/dWu saved 0.50 ms before the alignment fix, which gave
+the Triton kernel about the same gain, and it was not measured again after it.
+
+Finite results stayed bitwise identical on every supported input the review tried:
+route counts around each tile boundary, a single expert, one token, top-k from 1 to
+the expert count, hidden sizes from 256 to 2048, NaN-filled fresh buffers, and
+alternating plans. Non-finite inputs can differ. An Inf in `dout` can give NaN in
+dWd on CuTe, where it gave Inf, because a padding row multiplies the stale
+contents of its K-tile slot by zero. An Inf in the weights can give Inf where it
+gave NaN, because the weight-gradient K loops no longer multiply it by padding.
+
+The review also fixed or closed:
+
+- The `cp.async` commit above was already wrong for any expert with too few K tiles.
+  A 32-wide expert under `block_n=32` returned 32% error on the CuTe down
+  projection before this change. `test_cute_short_k_loop` covers it.
+- A one-row view of a wider tensor is contiguous but keeps its parent's stride, and
+  compiling a CuTe kernel on one raised an error. `test_cute_one_row_view` covers it.
+- `grouped_moe` now raises for hidden sizes other than 128 or a multiple of 256.
+  Those left part of the output or weight gradients unwritten.
+
+Still open, in both this and the previous code: CuTe launches on the default CUDA
+stream and ignores `torch.cuda.stream`, so running inside another stream gave wrong
+results in some runs. `block_n` 256 or 512 with unequal widths gives wrong
+routing-weight gradients. Non-contiguous `x` is silently wrong on Triton.

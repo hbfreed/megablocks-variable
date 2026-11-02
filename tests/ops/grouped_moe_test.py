@@ -291,6 +291,27 @@ def test_training_step_is_bitwise_reproducible(down_proj_backend, token_rounding
 
 @pytest.mark.gpu
 @pytest.mark.world_size(1)
+@pytest.mark.parametrize('down_proj_backend', ['triton', 'cute'])
+def test_unaligned_dout(down_proj_backend):
+    # The backward gathers read the caller's dout directly, and a contiguous
+    # view of it need not be 16-byte aligned.
+    if down_proj_backend == 'cute':
+        _require_cute()
+    top_k = 8
+    inputs = _inputs([128, 256, 384, 512] * 16, 1024, top_k, 1024)
+    _, want = _step(inputs, top_k, down_proj_backend)
+    dout = inputs[6]
+    flat = torch.cat((dout.new_zeros(1), dout.flatten()))
+    unaligned = flat[1:].view(dout.shape)
+    assert unaligned.data_ptr() % 16
+    _, got = _step(inputs[:6] + (unaligned,) + inputs[7:], top_k,
+                   down_proj_backend)
+    for name, g, w in zip(_GRAD_NAMES, got, want):
+        assert torch.equal(g, w), f'{name} differs bitwise'
+
+
+@pytest.mark.gpu
+@pytest.mark.world_size(1)
 @pytest.mark.parametrize(
     'widths, top_k, num_tokens',
     [
@@ -435,3 +456,75 @@ def test_route_stats(token_rounding):
         got = stats[name]
         assert got.device.type == 'cuda' and got.dim() == 0
         assert abs(got.item() - want) < 1e-6, (name, got.item(), want)
+
+
+@pytest.mark.gpu
+@pytest.mark.world_size(1)
+def test_cute_short_k_loop():
+    # One K tile with three pipeline stages: the prologue must still commit one
+    # cp.async group per stage, or its wait passes with data in flight. A 32-wide
+    # expert under block_n 32 reaches that, and it returned 32% error before.
+    _require_cute()
+    torch.manual_seed(0)
+    dev = torch.device('cuda')
+    widths, hidden, top_k, num_tokens = [32, 128], 256, 2, 200
+    total = sum(widths)
+    x = torch.randn(num_tokens, hidden, device=dev, dtype=torch.bfloat16)
+    w_gate = torch.randn(hidden, total, device=dev, dtype=torch.bfloat16) * 0.05
+    w_up = torch.randn(hidden, total, device=dev, dtype=torch.bfloat16) * 0.05
+    w_down = torch.randn(total, hidden, device=dev, dtype=torch.bfloat16) * 0.05
+    top_e = torch.tensor([[0, 1]] * num_tokens, device=dev)
+    top_w = torch.full((num_tokens, top_k), 0.5, device=dev, dtype=torch.bfloat16)
+    plan = FusedMoEPlan(widths, hidden, dev, block_n=32)
+    want = _reference(x, top_w, top_e, w_gate, w_up, w_down, widths)
+    for _ in range(3):
+        out = grouped_moe(x, top_w.flatten(), top_e.flatten().int(), plan, top_k,
+                          w_gate, w_up, w_down, down_proj_backend='cute')
+        assert _rel(out, want) < 1e-2
+
+
+@pytest.mark.gpu
+@pytest.mark.world_size(1)
+def test_cute_one_row_view():
+    # A one-row view is contiguous but keeps its parent's stride, which compiling
+    # a CuTe kernel used to reject. It must match the same data in a fresh tensor.
+    _require_cute()
+    torch.manual_seed(0)
+    dev = torch.device('cuda')
+    widths, hidden, total = [256, 128], 512, 384
+    big_x = torch.randn(4, 1024, device=dev, dtype=torch.bfloat16)
+    big_dout = torch.randn(4, 1024, device=dev, dtype=torch.bfloat16)
+    w_gate = (torch.randn(hidden, total, device=dev, dtype=torch.bfloat16) * 0.05).requires_grad_()
+    w_up = (torch.randn(hidden, total, device=dev, dtype=torch.bfloat16) * 0.05).requires_grad_()
+    w_down = (torch.randn(total, hidden, device=dev, dtype=torch.bfloat16) * 0.05).requires_grad_()
+    top_e = torch.tensor([0], device=dev, dtype=torch.int32)
+    plan = FusedMoEPlan(widths, hidden, dev)
+
+    def step(x, dout):
+        top_w = torch.ones(1, device=dev, dtype=torch.bfloat16)
+        out = grouped_moe(x, top_w, top_e, plan, 1, w_gate, w_up, w_down,
+                          down_proj_backend='cute')
+        grads = torch.autograd.grad(out, (w_gate, w_up, w_down), dout)
+        return out.detach(), grads
+
+    view = step(big_x[2:3, :512], big_dout[1:2, :512])
+    fresh = step(big_x[2:3, :512].clone(), big_dout[1:2, :512].clone())
+    assert torch.equal(view[0], fresh[0])
+    for got, want in zip(view[1], fresh[1]):
+        assert torch.equal(got, want)
+
+
+@pytest.mark.gpu
+@pytest.mark.world_size(1)
+@pytest.mark.parametrize('hidden', [64, 192, 384])
+def test_unsupported_hidden_raises(hidden):
+    # These sizes would leave part of the output or weight gradients unwritten.
+    dev = torch.device('cuda')
+    widths = [128, 256]
+    x = torch.randn(4, hidden, device=dev, dtype=torch.bfloat16)
+    w = torch.randn(hidden, sum(widths), device=dev, dtype=torch.bfloat16)
+    plan = FusedMoEPlan(widths, hidden, dev)
+    top_e = torch.zeros(4, device=dev, dtype=torch.int32)
+    top_w = torch.ones(4, device=dev, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match='hidden must be'):
+        grouped_moe(x, top_w, top_e, plan, 1, w, w, w.T)
