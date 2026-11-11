@@ -77,7 +77,6 @@ def _run(widths, hidden, top_k, num_tokens, seed=0, block_n=128):
 
 
 @pytest.mark.gpu
-@pytest.mark.world_size(1)
 @pytest.mark.parametrize('widths, hidden, top_k, num_tokens', _CASES)
 def test_matches_dense_reference(widths, hidden, top_k, num_tokens):
     rel = _run(widths, hidden, top_k, num_tokens)
@@ -85,7 +84,6 @@ def test_matches_dense_reference(widths, hidden, top_k, num_tokens):
 
 
 @pytest.mark.gpu
-@pytest.mark.world_size(1)
 def test_row_bound_is_never_exceeded():
     """The buffer bound is computed on the host with no knowledge of routing.
 
@@ -112,7 +110,6 @@ def test_row_bound_is_never_exceeded():
 
 
 @pytest.mark.gpu
-@pytest.mark.world_size(1)
 @pytest.mark.parametrize('num_tokens', [1, 7, 64, 512, 4096])
 def test_counting_sort_is_a_bijection(num_tokens):
     """The permute step ranks routes with an atomic cursor, not a stable sort.
@@ -171,7 +168,6 @@ def test_counting_sort_is_a_bijection(num_tokens):
 
 
 @pytest.mark.gpu
-@pytest.mark.world_size(1)
 def test_output_is_deterministic_despite_atomic_ordering():
     """Intra-bin order varies run to run; the output must not."""
     ref = None
@@ -183,7 +179,6 @@ def test_output_is_deterministic_despite_atomic_ordering():
 
 
 @pytest.mark.gpu
-@pytest.mark.world_size(1)
 @pytest.mark.parametrize(
     'widths, block_n',
     [
@@ -200,7 +195,6 @@ def test_other_width_blocks(widths, block_n):
 
 
 @pytest.mark.gpu
-@pytest.mark.world_size(1)
 def test_noncontiguous_inputs():
     # Strided x and weights must give what the same data gives in fresh tensors.
     top_k = 2
@@ -220,7 +214,6 @@ def test_noncontiguous_inputs():
 
 
 @pytest.mark.gpu
-@pytest.mark.world_size(1)
 @pytest.mark.parametrize('hidden', [96, 192, 320])
 def test_unsupported_hidden_raises(hidden):
     # These sizes read past each x row or leave output columns unwritten.
@@ -231,7 +224,6 @@ def test_unsupported_hidden_raises(hidden):
 
 
 @pytest.mark.gpu
-@pytest.mark.world_size(1)
 def test_int64_expert_ids_raise():
     # topk returns int64 indices, and the counting kernel failed to compile on
     # them with a Triton compiler dump instead of an error.

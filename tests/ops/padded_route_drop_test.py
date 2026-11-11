@@ -10,7 +10,6 @@ from megablocks import ops
 
 
 @pytest.mark.gpu
-@pytest.mark.world_size(1)
 def test_score_sorted_nearest_rounding_drops_lowest_route():
     moe = MoEMLP(
         GPTConfig(
@@ -48,7 +47,6 @@ def test_score_sorted_nearest_rounding_drops_lowest_route():
 
 
 @pytest.mark.gpu
-@pytest.mark.world_size(1)
 @pytest.mark.parametrize("top_k", [1, 2])
 def test_dropped_routes_are_zero_in_forward_and_backward(top_k: int):
     num_routes = 260
@@ -96,7 +94,6 @@ def test_dropped_routes_are_zero_in_forward_and_backward(top_k: int):
 
 
 @pytest.mark.gpu
-@pytest.mark.world_size(1)
 def test_nearest_rounding_runs_full_moe_forward_and_backward():
     """Exercise score sorting, rounded topology, and dropped-route gradients together."""
     if gpt_model.nanomoe_ops is None:

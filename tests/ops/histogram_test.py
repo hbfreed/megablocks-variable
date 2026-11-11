@@ -64,7 +64,7 @@ _HISTOGRAM_TESTS = (
 )
 
 
-# Override the seed_all fixture in autouse.py because the torch.histc
+# Override the seed_all fixture in conftest.py because the torch.histc
 # reference (_histc_cuda) does not have a deterministic implementation.
 # Restore the mode afterwards so later test modules still run deterministically.
 @pytest.fixture()

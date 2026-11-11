@@ -63,3 +63,10 @@ def test_sort(n: int, dtype: torch.dtype, max_val: Optional[int]):
     expected_data = torch.empty_like(x)
     expected_data.scatter_(0, expected_indices, expected_out)
     assert torch.all(torch.eq(data, expected_data))
+
+
+def test_sort_rejects_indices_that_overflow_the_dtype():
+    x = torch.zeros(2**15 + 1, dtype=torch.int16)
+    with pytest.raises(ValueError, match='do not fit'):
+        ops.sort(x)
+    ops.sort(x[:2**15])

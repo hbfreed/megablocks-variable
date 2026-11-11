@@ -1,5 +1,11 @@
 # Variable-MoE: correctness fix + kernel optimization
 
+> This is a chronological log. The sections up to "Results" describe the
+> block-sparse STK layer in `gpt_model.py`, which is kept for legacy consumers.
+> Current work is on `megablocks/backend/fused_moe.py` (serving) and
+> `grouped_moe.py` (training), covered from "Serving" onward; later sections
+> supersede earlier numbers.
+
 Work on the variable-size `MoEMLP` (`gpt_model.py`) exercised by
 `profile_moe.py --variable-only`. Two independent outcomes:
 
@@ -507,8 +513,8 @@ reduction, since the rest of the step, routing included, does not shrink.
 
 Ceil pads about half a tile per expert on average. Nearest moves each count
 by about a quarter tile, dropping routes for roughly half of the experts and
-padding the rest. Both shares fall as tokens per expert grow. Counting routes on the CPU for the same table and skew,
-averaged over eight routing draws:
+padding the rest. Both shares fall as tokens per expert grow. Counting routes
+on the CPU for the same table and skew, averaged over eight routing draws:
 
 | tokens | routes per expert | dropped | ceil padding | GEMM rows saved |
 |---:|---:|---:|---:|---:|
