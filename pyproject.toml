@@ -65,9 +65,12 @@ all = [
 
 # Pytest
 [tool.pytest.ini_options]
-# By default, run tests in README codeblocks, raise typos in fixtures as errors,
-# have a short traceback, skip gpu tests, and display in color
-addopts = "--codeblocks --strict-markers --tb=short -m 'not gpu' --color=yes"
+# By default, raise typos in fixtures as errors, have a short traceback, skip
+# gpu tests, and display in color. Do not add --codeblocks: it executes every
+# shell block in the Markdown files, which clone the repository, sync
+# environments, and install git hooks.
+addopts = "--strict-markers --tb=short -m 'not gpu' --color=yes"
+testpaths = ["tests"]
 pythonpath = [
   "."
 ]
@@ -112,6 +115,7 @@ include = [
 preview = true # enable preview features, see https://docs.astral.sh/ruff/preview/
 
 exclude = [
+    ".claude/**",
     "build/**",
     "docs/**",
     "node_modules/**",

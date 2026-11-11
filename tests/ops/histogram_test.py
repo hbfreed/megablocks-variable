@@ -64,12 +64,14 @@ _HISTOGRAM_TESTS = (
 )
 
 
-# Override the seed_all fixture in autouse.py because
-# _histc_cuda does not have a deterministic implementation
+# Override the seed_all fixture in autouse.py because the torch.histc
+# reference (_histc_cuda) does not have a deterministic implementation.
+# Restore the mode afterwards so later test modules still run deterministically.
 @pytest.fixture()
 def seed_all():
     torch.use_deterministic_algorithms(False)
-    return
+    yield
+    torch.use_deterministic_algorithms(True)
 
 
 @pytest.mark.gpu

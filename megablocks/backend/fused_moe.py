@@ -15,21 +15,23 @@ connect to *all* of that expert's weight column-blocks and to nothing else -- so
 there is no sparsity for a block-sparse GEMM to exploit. It is a grouped GEMM
 over experts, and once expressed that way the row tile no longer has to be 128.
 
-This module uses 16-row tiles (the tensor-core minimum) and fuses the pipeline
-into four launches:
+This module uses row tiles as small as 16 (the tensor-core minimum) and fuses
+the pipeline into five launches:
 
-  1. `_plan_tiles`     one CTA: per-expert row/tile offsets from `bins`
-  2. `_map_routes`     route -> padded row, and row -> source token
-  3. `_gate_up_silu`   gathers x rows, both projections, SiLU-mul, in one pass
-  4. `_down_proj`      the down projection
+  1. `_count_experts`  per-expert route counts
+  2. `_plan_tiles`     one CTA: per-expert row/tile offsets from the counts
+  3. `_scatter_routes` route -> padded row, and row -> source token
+  4. `_gate_up_silu`   gathers x rows, both projections, SiLU-mul, in one pass
+  5. `_down_proj`      the down projection
 
 followed by the existing `_scatter_reduce`, which already consumes exactly the
 `route_rows` mapping produced here. Nothing needs a host sync: every buffer is
 sized from a bound computed on the host from `num_tokens`, `top_k` and the
 static expert widths, and planned-but-unused tiles carry expert id -1 and exit.
 
-Widths must be multiples of `BLOCK_N` (128), which the checkpoint format already
-guarantees.
+Widths must be multiples of the plan's width block (128 by default), which the
+checkpoint format already guarantees. The hidden size must be a multiple of 64
+and of the width block.
 """
 
 import torch
@@ -316,21 +318,37 @@ def fused_moe_forward(
 
     `expert_ids` and `top_weights` are the flattened (tokens * top_k) routed
     expert ids (int32) and routing weights (x's dtype), in token-major order --
-    i.e. `top_e.flatten()`, straight from topk, with no sorting needed. Returns
+    i.e. `top_e.flatten().int()`, straight from topk, with no sorting needed. Returns
     (tokens, hidden). Inference only -- nothing here is differentiable.
     """
     from megablocks.backend import kernels
 
     num_tokens, hidden = x.shape
     num_routes = num_tokens * top_k
+    bn = plan.block_n
     if hidden != plan.hidden_size:
         raise ValueError(f'expected hidden {plan.hidden_size}, got {hidden}')
+    # _gate_up_silu contracts over hidden in tiles of 64, and _down_proj tiles
+    # the output in the width block. Any other size reads past each row or
+    # leaves output columns unwritten.
+    if hidden % 64 or hidden % bn:
+        raise ValueError(
+            f'hidden must be a multiple of 64 and of the width block {bn}, '
+            f'got {hidden}',
+        )
     if expert_ids.numel() != num_routes:
         raise ValueError(
             f'expected {num_routes} expert ids, got {expert_ids.numel()}',
         )
+    if expert_ids.dtype != torch.int32:
+        raise TypeError(f'expert_ids must be int32, got {expert_ids.dtype}')
+    # Every kernel addresses these with computed offsets.
+    x, expert_ids = x.contiguous(), expert_ids.contiguous()
+    w_gate, w_up, w_down = (w_gate.contiguous(), w_up.contiguous(),
+                            w_down.contiguous())
+    if top_weights is not None:
+        top_weights = top_weights.contiguous()
 
-    bn = plan.block_n
     bm, warps, stages = plan.tile_config(num_tokens, top_k)
     num_warps = warps if num_warps is None else num_warps
     num_stages = stages if num_stages is None else num_stages
@@ -409,7 +427,8 @@ def fused_moe_forward(
         WIDTH_BLOCK=bn,
         BLOCK_M=bm,
         BLOCK_N=bn,
-        BLOCK_K=64,
+        # The contraction runs over the expert's width, a multiple of bn.
+        BLOCK_K=min(64, bn),
         num_warps=num_warps,
         num_stages=num_stages,
     )

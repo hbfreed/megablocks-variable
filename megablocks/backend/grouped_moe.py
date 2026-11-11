@@ -95,7 +95,8 @@ _ROW_BLOCK = 128
 # drops to one LDG per bf16 with no cp.async: W in _proj_rows and _dx_rows_fused,
 # the rows in _wgrad_rows and _wgrad_gather. Offsets are multiples of the width
 # block, so for any width block the K tiles allow `(off >> 3) << 3` changes no
-# value, and it proves the 16 bytes cp.async needs. It saves 1.2 ms of a 10.4 ms CuTe step and 1.6 ms of 11.5 ms on Triton.
+# value, and it proves the 16 bytes cp.async needs. It saves 1.2 ms of a
+# 10.4 ms CuTe step and 1.6 ms of 11.5 ms on Triton.
 
 # Routes per counting-sort block; _count_blocks and _scatter_routes_stable must
 # partition the routes identically.
@@ -639,8 +640,9 @@ def _route(expert_ids, top_weights, plan, top_k, m_tiles, row_bound,
     (0 for padding). token_rounding='ceil' keeps every route, in route order
     within its expert. 'nearest' keeps each expert's count rounded half up to
     whole row tiles, but at least one tile's worth, highest route_scores first
-    (top_weights when route_scores is None). Either layout is a pure function of the inputs. Leaves this
-    call's kept counts in plan.counts and row starts in plan.expert_row_start.
+    (top_weights when route_scores is None). Either layout is a pure function
+    of the inputs. Leaves this call's kept counts in plan.counts and row starts
+    in plan.expert_row_start.
     A float32 (2,) `stats` receives the dropped-route and padding-row
     fractions (see _route_stats).
     """
@@ -822,10 +824,20 @@ class _GroupedMoE(torch.autograd.Function):
         # weight gradients is never written.
         if hidden != 128 and hidden % 256:
             raise ValueError(f'hidden must be 128 or a multiple of 256, got {hidden}')
+        # The row-tile and weight-gradient kernels tile the width axis in 128s.
+        # A narrower width block runs tiles past an expert's width and leaves
+        # part of the weight gradients unwritten.
+        if plan.block_n % 128:
+            raise ValueError(
+                'the plan\'s width block must be a multiple of 128, got '
+                f'{plan.block_n}',
+            )
         if expert_ids.numel() != num_routes:
             raise ValueError(
                 f'expected {num_routes} expert ids, got {expert_ids.numel()}',
             )
+        if expert_ids.dtype != torch.int32:
+            raise TypeError(f'expert_ids must be int32, got {expert_ids.dtype}')
         if down_proj_backend not in ('triton', 'cute'):
             raise ValueError(
                 "down_proj_backend must be 'triton' or 'cute', got "
@@ -1172,7 +1184,8 @@ def grouped_moe(
 
     Same calling convention as fused_moe_forward: `expert_ids` and
     `top_weights` are the flattened (tokens * top_k) routed expert ids (int32)
-    and routing weights, token-major, straight from topk. Returns
+    and routing weights, token-major, straight from topk. Expert widths must
+    be multiples of 128, and hidden 128 or a multiple of 256. Returns
     (tokens, hidden), differentiable w.r.t. x, top_weights and all three
     weights. ``down_proj_backend='cute'`` opts into the experimental Ampere
     CuTe DSL gate, up and down projections, input gradients, and
@@ -1185,10 +1198,11 @@ def grouped_moe(
     expert that rounds down drops its lowest-scoring routes, which then
     contribute nothing and receive no gradient. Unlike gpt_model, an expert with
     routes never rounds down to zero, so an expert under 64 routes keeps them
-    all. The surviving weights are not renormalized. ``route_scores`` (flattened like ``top_weights``, in [0, 1],
-    e.g. the router probabilities before top-k renormalization) ranks the
-    routes; it defaults to ``top_weights``. The default ``'ceil'`` keeps every
-    route and pads each expert to whole tiles instead.
+    all. The surviving weights are not renormalized. ``route_scores``
+    (flattened like ``top_weights``, in [0, 1], e.g. the router probabilities
+    before top-k renormalization) ranks the routes; it defaults to
+    ``top_weights``. The default ``'ceil'`` keeps every route and pads each
+    expert to whole tiles instead.
 
     ``return_route_stats=True`` returns ``(output, stats)``, where ``stats``
     maps ``'dropped_route_fraction'`` and ``'padding_route_fraction'`` --

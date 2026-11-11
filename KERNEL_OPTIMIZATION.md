@@ -211,8 +211,7 @@ but the application must provide and test the graph wrapper.
 Timing: `profile_moe.py --variable-only`. Correctness: a dense fp32 expert-loop
 reference (see the bug table) — **not** the old pristine baseline, which is buggy.
 Full fwd+bwd (output, aux losses, all grads) is bit-identical to the corrected
-sort-based path. (`tests/` can't run out of the box: `conftest.py` imports
-`composer`, which isn't installed.)
+sort-based path.
 
 ## Persistent-kernel experiment (2026-08-12, negative result)
 
