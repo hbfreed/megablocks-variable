@@ -16,14 +16,14 @@ extensions:
 ```bash
 git clone https://github.com/hbfreed/megablocks-variable.git
 cd megablocks-variable
-UV_TORCH_BACKEND=cu126 uv sync --extra dev
+uv sync --extra dev
 ```
 
 Add `--extra cute` when working on the optional CuTe backend. Set
-`MEGABLOCKS_BUILD_EXTENSIONS=1` only when testing the legacy
-`nanomoe_ops.indices_variable` compatibility extension.
+`MEGABLOCKS_BUILD_EXTENSIONS=1` only when testing the legacy `nanomoe_ops`
+extension.
 
-Install the formatting hooks if you plan to contribute regularly:
+Install the lint hooks if you plan to contribute regularly:
 
 ```bash
 uv run pre-commit install

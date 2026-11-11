@@ -1,19 +1,10 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.10"
 resolution-markers = [
     "python_full_version >= '3.12'",
     "python_full_version == '3.11.*'",
     "python_full_version < '3.11'",
-]
-
-[[package]]
-name = "absl-py"
-version = "2.3.1"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/10/2a/c93173ffa1b39c1d0395b7e842bbdc62e556ca9d8d3b5572926f3e4ca752/absl_py-2.3.1.tar.gz", hash = "sha256:a97820526f7fbfd2ec1bce83f3f25e3a14840dac0d8e02a0b71cd75db3f77fc9", size = 116588, upload-time = "2025-07-03T09:31:44.05Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/8f/aa/ba0014cc4659328dc818a28827be78e6d97312ab0cb98105a770924dc11e/absl_py-2.3.1-py3-none-any.whl", hash = "sha256:eeecf07f0c2a93ace0772c92e596ace6d3d3996c042b2128459aaae2a76de11d", size = 135811, upload-time = "2025-07-03T09:31:42.253Z" },
 ]
 
 [[package]]
@@ -211,34 +202,34 @@ wheels = [
 
 [package.optional-dependencies]
 cudart = [
-    { name = "nvidia-cuda-runtime", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cuda-runtime" },
 ]
 cufft = [
-    { name = "nvidia-cufft", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cufft" },
 ]
 cufile = [
-    { name = "nvidia-cufile", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-cufile" },
 ]
 cupti = [
-    { name = "nvidia-cuda-cupti", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cuda-cupti" },
 ]
 curand = [
-    { name = "nvidia-curand", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-curand" },
 ]
 cusolver = [
-    { name = "nvidia-cusolver", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cusolver" },
 ]
 cusparse = [
-    { name = "nvidia-cusparse", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cusparse" },
 ]
 nvjitlink = [
-    { name = "nvidia-nvjitlink", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-nvjitlink" },
 ]
 nvrtc = [
-    { name = "nvidia-cuda-nvrtc", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cuda-nvrtc" },
 ]
 nvtx = [
-    { name = "nvidia-nvtx", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-nvtx" },
 ]
 
 [[package]]
@@ -264,7 +255,7 @@ name = "exceptiongroup"
 version = "1.3.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "typing-extensions", marker = "python_full_version < '3.11'" },
+    { name = "typing-extensions" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/50/79/66800aadf48771f6b62f7eb014e352e5d06856655206165d775e675a02c9/exceptiongroup-1.3.1.tar.gz", hash = "sha256:8b412432c6055b0b7d14c310000ae93352ed6754f70fa8f7c34141f91c4e3219", size = 30371, upload-time = "2025-11-21T23:01:54.787Z" }
 wheels = [
@@ -288,12 +279,6 @@ sdist = { url = "https://files.pythonhosted.org/packages/d5/7d/5df2650c57d47c572
 wheels = [
     { url = "https://files.pythonhosted.org/packages/01/c9/97cc5aae1648dcb851958a3ddf73ccd7dbe5650d95203ecb4d7720b4cdbf/fsspec-2026.1.0-py3-none-any.whl", hash = "sha256:cb76aa913c2285a3b49bdd5fc55b1d7c708d7208126b60f2eb8194fe1b4cbdcc", size = 201838, upload-time = "2026-01-09T15:21:34.041Z" },
 ]
-
-[[package]]
-name = "grouped-gemm"
-version = "0.3.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/1a/90/d255544a8da444fdfab7287850316d2c7961003586a35d3042787982e66c/grouped_gemm-0.3.0.tar.gz", hash = "sha256:f0555da33a975610e9160f52449082c5e699525524581a0e5f990b14b02676a3", size = 981113, upload-time = "2025-05-29T18:25:38.913Z" }
 
 [[package]]
 name = "identify"
@@ -412,71 +397,64 @@ wheels = [
 
 [[package]]
 name = "megablocks"
-version = "0.11.0.dev0"
 source = { editable = "." }
 dependencies = [
-    { name = "einops" },
-    { name = "numpy" },
-    { name = "packaging" },
-    { name = "stanford-stk" },
     { name = "torch" },
 ]
 
 [package.optional-dependencies]
 all = [
-    { name = "absl-py" },
     { name = "apache-tvm-ffi" },
     { name = "coverage", extra = ["toml"] },
-    { name = "grouped-gemm" },
+    { name = "einops" },
+    { name = "numpy" },
     { name = "nvidia-cutlass-dsl" },
     { name = "pre-commit" },
     { name = "pytest" },
-    { name = "pytest-codeblocks" },
     { name = "pytest-cov" },
+    { name = "stanford-stk" },
 ]
 cute = [
     { name = "apache-tvm-ffi" },
     { name = "nvidia-cutlass-dsl" },
 ]
 dev = [
-    { name = "absl-py" },
     { name = "coverage", extra = ["toml"] },
+    { name = "einops" },
+    { name = "numpy" },
     { name = "pre-commit" },
     { name = "pytest" },
-    { name = "pytest-codeblocks" },
     { name = "pytest-cov" },
+    { name = "stanford-stk" },
 ]
-gg = [
-    { name = "grouped-gemm" },
+stk = [
+    { name = "stanford-stk" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "absl-py", marker = "extra == 'all'" },
-    { name = "absl-py", marker = "extra == 'dev'" },
     { name = "apache-tvm-ffi", marker = "extra == 'all'", specifier = ">=0.1.0,<0.2" },
     { name = "apache-tvm-ffi", marker = "extra == 'cute'", specifier = ">=0.1.0,<0.2" },
     { name = "coverage", extras = ["toml"], marker = "extra == 'all'", specifier = "==7.4.4" },
     { name = "coverage", extras = ["toml"], marker = "extra == 'dev'", specifier = "==7.4.4" },
-    { name = "einops" },
-    { name = "grouped-gemm", marker = "extra == 'all'", specifier = "==0.3.0" },
-    { name = "grouped-gemm", marker = "extra == 'gg'", specifier = "==0.3.0" },
-    { name = "numpy", specifier = ">=1.21.5,<2.1.0" },
+    { name = "einops", marker = "extra == 'all'" },
+    { name = "einops", marker = "extra == 'dev'" },
+    { name = "numpy", marker = "extra == 'all'", specifier = ">=1.21.5,<2.1.0" },
+    { name = "numpy", marker = "extra == 'dev'", specifier = ">=1.21.5,<2.1.0" },
     { name = "nvidia-cutlass-dsl", marker = "extra == 'all'", specifier = ">=4.6.0,<4.7" },
     { name = "nvidia-cutlass-dsl", marker = "extra == 'cute'", specifier = ">=4.6.0,<4.7" },
-    { name = "packaging", specifier = ">=21.3.0" },
     { name = "pre-commit", marker = "extra == 'all'", specifier = ">=3.4.0,<4" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=3.4.0,<4" },
     { name = "pytest", marker = "extra == 'all'", specifier = ">=7.2.1,<8" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.2.1,<8" },
-    { name = "pytest-codeblocks", marker = "extra == 'all'", specifier = ">=0.16.1,<0.17" },
-    { name = "pytest-codeblocks", marker = "extra == 'dev'", specifier = ">=0.16.1,<0.17" },
     { name = "pytest-cov", marker = "extra == 'all'", specifier = ">=4,<5" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=4,<5" },
-    { name = "stanford-stk", specifier = "==0.7.1" },
+    { name = "stanford-stk", marker = "extra == 'all'", specifier = "==0.7.1" },
+    { name = "stanford-stk", marker = "extra == 'dev'", specifier = "==0.7.1" },
+    { name = "stanford-stk", marker = "extra == 'stk'", specifier = "==0.7.1" },
     { name = "torch", specifier = ">=2.11.0,<2.13" },
 ]
-provides-extras = ["gg", "cute", "dev", "testing", "all"]
+provides-extras = ["stk", "cute", "dev", "all"]
 
 [[package]]
 name = "mpmath"
@@ -875,18 +853,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/80/1f/9d8e98e4133ffb16c90f3b405c43e38d3abb715bb5d7a63a5a684f7e46a3/pytest-7.4.4.tar.gz", hash = "sha256:2cf0005922c6ace4a3e2ec8b4080eb0d9753fdc93107415332f50ce9e7994280", size = 1357116, upload-time = "2023-12-31T12:00:18.035Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/51/ff/f6e8b8f39e08547faece4bd80f89d5a8de68a38b2d179cc1c4490ffa3286/pytest-7.4.4-py3-none-any.whl", hash = "sha256:b090cdf5ed60bf4c45261be03239c2c1c22df034fbffe691abe93cd80cea01d8", size = 325287, upload-time = "2023-12-31T12:00:13.963Z" },
-]
-
-[[package]]
-name = "pytest-codeblocks"
-version = "0.16.2"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "pytest" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/ba/f5/847eb4a320600d917b38832eaa287a872abc96681cb0cb91282f536bc077/pytest_codeblocks-0.16.2.tar.gz", hash = "sha256:fd4c1c913a49df4c8f107728418e7ffb454be0f2676ea6e972eb77ae03c6c373", size = 11155, upload-time = "2023-09-17T19:04:57.584Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/05/2d/715bece123dcd0424305633a67acca192f6adb71e4a7c0b332e3ed32187d/pytest_codeblocks-0.16.2-py3-none-any.whl", hash = "sha256:488726753a34583b5263a1518ae57d87543b8384e5e46c652e2779d9bd0e40bf", size = 7739, upload-time = "2023-09-17T19:04:55.925Z" },
 ]
 
 [[package]]
