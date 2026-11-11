@@ -73,7 +73,7 @@ class _AmpereRaggedDown:
         atom_layout_mnk=(2, 4, 1),
         weight_mode="down",
     ):
-        if weight_mode not in ("down", "dx", "dx_fused", "wgrad"):
+        if weight_mode not in ("down", "dx_fused", "wgrad"):
             raise ValueError(f"unsupported ragged GEMM mode: {weight_mode!r}")
         self.cta_tiler = cta_tiler
         self.num_stages = num_stages
@@ -1173,7 +1173,6 @@ class _CompiledKernel:
 
 
 _CACHE: dict[tuple, _CompiledKernel] = {}
-_DX_CACHE: dict[tuple, _CompiledKernel] = {}
 _DX_FUSED_CACHE: dict[tuple, _CompiledKernel] = {}
 _WGRAD_CACHE: dict[tuple, _CompiledKernel] = {}
 _GATE_UP_CACHE: dict[tuple, _CompiledKernel] = {}
@@ -1311,85 +1310,6 @@ def cute_down_proj(
         h,
         w_down,
         y,
-        tile_expert,
-        expert_col_off,
-        expert_nblocks,
-        expert_col_off,
-    )
-
-
-def cute_dx_proj(
-    d_rows: torch.Tensor,
-    weight: torch.Tensor,
-    out: torch.Tensor,
-    tile_expert: torch.Tensor,
-    expert_col_off: torch.Tensor,
-    expert_nblocks: torch.Tensor,
-    width_block: int,
-) -> None:
-    """One gate/up input-gradient stream using packed [hidden, width] weights."""
-    tensors = (
-        d_rows,
-        weight,
-        out,
-        tile_expert,
-        expert_col_off,
-        expert_nblocks,
-    )
-    if not all(t.is_cuda and t.is_contiguous() for t in tensors):
-        raise ValueError("CuTe input-gradient tensors must be contiguous CUDA tensors")
-    if len({t.device for t in tensors}) != 1:
-        raise ValueError("CuTe input-gradient tensors must share a device")
-    if torch.cuda.get_device_capability(d_rows.device)[0] != 8:
-        raise ValueError("CuTe Ampere input gradient requires compute capability 8.x")
-    if any(t.dtype != torch.bfloat16 for t in tensors[:3]):
-        raise TypeError("CuTe Ampere input gradient currently supports BF16 only")
-    if any(t.dtype != torch.int32 for t in tensors[3:]):
-        raise TypeError("expert metadata tensors must be int32")
-    if d_rows.ndim != 2 or weight.ndim != 2 or out.ndim != 2:
-        raise ValueError("d_rows, weight, and out must be matrices")
-    if d_rows.shape[0] != out.shape[0] or tile_expert.numel() * 128 != out.shape[0]:
-        raise ValueError("tile_expert must contain one entry per 128 rows")
-    if weight.shape[0] != out.shape[1] or out.shape[1] % 256:
-        raise ValueError("weight hidden dimension must match a 256-aligned output")
-    if expert_col_off.shape != expert_nblocks.shape:
-        raise ValueError("expert metadata arrays must have the same shape")
-    if width_block % 32:
-        raise ValueError("width_block must be a multiple of the 32-column K tile")
-
-    signature = (
-        d_rows.device.index,
-        d_rows.dtype,
-        d_rows.shape[1],
-        tuple(weight.shape),
-        out.shape[1],
-        width_block,
-    )
-    compiled = _DX_CACHE.get(signature)
-    if compiled is None:
-        args = (
-            _as_cute(d_rows, dynamic_dim0=True, dim0_divisibility=128),
-            _as_cute(weight),
-            _as_cute(d_rows, dynamic_dim0=True, dim0_divisibility=128),
-            _as_cute(weight),
-            _as_cute(out, dynamic_dim0=True, dim0_divisibility=128),
-            _as_cute(tile_expert, dynamic_dim0=True),
-            _as_cute(expert_col_off, dynamic_dim0=True),
-            _as_cute(expert_nblocks, dynamic_dim0=True),
-            _as_cute(expert_col_off, dynamic_dim0=True),
-        )
-        op = _AmpereRaggedDown(atom_layout_mnk=(2, 4, 1), weight_mode="dx")
-        fn = cute.compile(op, *args, width_block, _ENV_STREAM, options="--enable-tvm-ffi")
-        compiled = _CompiledKernel(fn, signature)
-        _DX_CACHE[signature] = compiled
-
-    _launch(
-        compiled,
-        d_rows,
-        weight,
-        d_rows,
-        weight,
-        out,
         tile_expert,
         expert_col_off,
         expert_nblocks,
