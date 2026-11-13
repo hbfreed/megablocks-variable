@@ -11,8 +11,6 @@ steps must produce identical outputs and gradients. Nearest token rounding is
 checked against the same reference restricted to the routes it keeps.
 """
 
-import importlib.util
-
 import pytest
 import torch
 import torch.nn.functional as F
@@ -126,7 +124,7 @@ def _inputs(
 def _step(
     inputs,
     top_k,
-    down_proj_backend='triton',
+    down_proj_backend='auto',
     recompute_activation=True,
     token_rounding='ceil',
 ):
@@ -183,8 +181,8 @@ def _assert_close(errs):
 
 
 def _require_cute():
-    if importlib.util.find_spec('cutlass') is None:
-        pytest.skip('nvidia-cutlass-dsl is not installed')
+    if grouped_moe_module._cute() is None:
+        pytest.skip('the cute extra is not installed')
     if torch.cuda.get_device_capability()[0] != 8:
         pytest.skip('the experimental CuTe backend currently targets Ampere')
 
@@ -354,15 +352,18 @@ def test_routing_layout_is_stable(widths, top_k, num_tokens):
 
 
 @pytest.mark.gpu
-def test_forward_saves_no_hidden_wide_route_buffer():
+@pytest.mark.parametrize('down_proj_backend', ['triton', 'cute'])
+def test_forward_saves_no_hidden_wide_route_buffer(down_proj_backend):
     # With w_r folded into h, backward derives the routing-weight gradient
     # from the intermediate, so the (rows, hidden) down-projection output is
     # not kept. Nothing hidden-wide may be saved besides the input leaves.
+    if down_proj_backend == 'cute':
+        _require_cute()
     hidden, top_k = 1024, 4
     x, top_w, top_e, w_gate, w_up, w_down, _, plan, _ = _inputs(
         [128, 256] * 8, hidden, top_k, 300)
     out = grouped_moe(x, top_w.flatten(), top_e.flatten().int(), plan, top_k,
-                      w_gate, w_up, w_down)
+                      w_gate, w_up, w_down, down_proj_backend)
     leaves = {t.data_ptr() for t in (x, top_w, w_gate, w_up, w_down)}
     wide = [
         tuple(t.shape) for t in out.grad_fn.saved_tensors
@@ -633,3 +634,38 @@ def test_int64_expert_ids_raise():
     with pytest.raises(TypeError, match='int32'):
         grouped_moe(x, top_w.flatten(), top_e.flatten(), plan, 2,
                     w_gate, w_up, w_down)
+
+
+@pytest.mark.gpu
+def test_auto_picks_cute():
+    # Where the CuTe kernels run, 'auto' must run them, bit for bit.
+    _require_cute()
+    top_k = 2
+    inputs = _inputs([128, 256] * 4, 512, top_k, 100)
+    want_out, want_grads = _step(inputs, top_k, 'cute')
+    out, grads = _step(inputs, top_k, 'auto')
+    assert torch.equal(out, want_out)
+    for name, got, want in zip(_GRAD_NAMES, grads, want_grads):
+        assert torch.equal(got, want), f'{name} differs bitwise'
+
+
+@pytest.mark.gpu
+def test_auto_falls_back_to_triton(monkeypatch):
+    def resolve(hidden=512, dtype=torch.bfloat16):
+        x = torch.empty(4, hidden, device='cuda', dtype=dtype)
+        w = torch.empty(hidden, 128, device='cuda', dtype=dtype)
+        return grouped_moe_module._resolve_backend(x, w, w, w.T)
+
+    assert resolve(hidden=128) == 'triton'
+    assert resolve(dtype=torch.float16) == 'triton'
+    monkeypatch.setattr(grouped_moe_module, '_cute', lambda: None)
+    assert resolve() == 'triton'
+
+
+@pytest.mark.gpu
+def test_unknown_backend_raises():
+    x, top_w, top_e, w_gate, w_up, w_down, _, plan, _ = _inputs(
+        [128, 256], 256, 2, 20)
+    with pytest.raises(ValueError, match="'auto', 'triton' or 'cute'"):
+        grouped_moe(x, top_w.flatten(), top_e.flatten().int(), plan, 2,
+                    w_gate, w_up, w_down, down_proj_backend='cuda')

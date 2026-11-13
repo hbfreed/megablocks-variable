@@ -357,10 +357,10 @@ kernels; the small remaining loss and extra dependency did not justify a
 production rewrite. See the [Helion project](https://github.com/pytorch/helion)
 and its [deployment/autotuning guide](https://helionlang.com/deployment_autotuning.html).
 
-The backend remains opt-in because CUTLASS DSL is a large optional dependency
-and the implementation currently supports only BF16 Ampere with hidden sizes
-divisible by 256. Install `megablocks[cute]` and pass
-`down_proj_backend="cute"` to `grouped_moe`; Triton remains the default.
+CUTLASS DSL stays an optional dependency, and the implementation supports only
+BF16 Ampere with hidden sizes divisible by 256. Since 2026-11-13 the default
+`down_proj_backend="auto"` selects CuTe when `megablocks[cute]` is installed
+and a call meets those conditions, and Triton otherwise.
 
 ## Saved-output removal and stable routing (2026-10-29)
 

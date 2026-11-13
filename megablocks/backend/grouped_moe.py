@@ -58,6 +58,8 @@ read. Weight gradients cover every weight block unconditionally, so untouched
 experts get exact-zero grads rather than stale memory.
 """
 
+import functools
+
 import torch
 import triton
 import triton.language as tl
@@ -775,6 +777,24 @@ def _route(expert_ids, top_weights, plan, top_k, m_tiles, row_bound,
     return tile_expert, route_tokens, route_rows, row_w
 
 
+@functools.cache
+def _cute():
+    """The CuTe kernel module, or None when the cute extra is not installed."""
+    try:
+        from megablocks.backend import cute_down_proj
+    except ImportError:
+        return None
+    return cute_down_proj
+
+
+def _resolve_backend(x, w_gate, w_up, w_down):
+    """Picks 'cute' where its kernels are installed and apply, else 'triton'."""
+    cute = _cute()
+    if cute is not None and cute.supports(x, w_gate, w_up, w_down):
+        return 'cute'
+    return 'triton'
+
+
 def _wb_expert_table(plan, block_w):
     """Column-block -> expert id, cached per (plan, block size)."""
     cache = getattr(plan, '_wb_expert', None)
@@ -838,11 +858,13 @@ class _GroupedMoE(torch.autograd.Function):
             )
         if expert_ids.dtype != torch.int32:
             raise TypeError(f'expert_ids must be int32, got {expert_ids.dtype}')
-        if down_proj_backend not in ('triton', 'cute'):
+        if down_proj_backend not in ('auto', 'triton', 'cute'):
             raise ValueError(
-                "down_proj_backend must be 'triton' or 'cute', got "
+                "down_proj_backend must be 'auto', 'triton' or 'cute', got "
                 f'{down_proj_backend!r}',
             )
+        if down_proj_backend == 'auto':
+            down_proj_backend = _resolve_backend(x, w_gate, w_up, w_down)
         if not isinstance(recompute_activation, bool):
             raise TypeError('recompute_activation must be a bool')
         if token_rounding not in ('ceil', 'nearest'):
@@ -1174,7 +1196,7 @@ def grouped_moe(
     w_gate,
     w_up,
     w_down,
-    down_proj_backend='triton',
+    down_proj_backend='auto',
     recompute_activation=True,
     token_rounding='ceil',
     route_scores=None,
@@ -1187,9 +1209,13 @@ def grouped_moe(
     and routing weights, token-major, straight from topk. Expert widths must
     be multiples of 128, and hidden 128 or a multiple of 256. Returns
     (tokens, hidden), differentiable w.r.t. x, top_weights and all three
-    weights. ``down_proj_backend='cute'`` opts into the experimental Ampere
-    CuTe DSL gate, up and down projections, input gradients, and
-    down-projection weight gradient. The remaining kernels use Triton. Set
+    weights. ``down_proj_backend`` picks the gate, up and down projections,
+    input gradients, and down-projection weight gradient: ``'cute'`` uses the
+    Ampere CuTe DSL kernels and ``'triton'`` the Triton ones. The default
+    ``'auto'`` uses CuTe when the ``cute`` extra is installed, the GPU is
+    compute capability 8.x, x and the weights are BF16 and hidden is a
+    multiple of 256, and Triton otherwise. The remaining kernels always use
+    Triton. Set
     ``recompute_activation=False`` to retain the forward SwiGLU activation and
     trade activation memory for a faster backward pass.
 

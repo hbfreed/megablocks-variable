@@ -79,8 +79,11 @@ Install the CuTe extra:
 uv sync --extra cute
 ```
 
-The current CuTe implementation targets BF16 on Ampere (compute capability
-8.x) with hidden sizes divisible by 256. Select it explicitly:
+The CuTe kernels target BF16 on Ampere (compute capability 8.x) with hidden
+sizes divisible by 256, where they run 3-7% faster than Triton per layer. The
+default `down_proj_backend="auto"` uses them whenever the extra is installed and
+the call qualifies, and Triton otherwise, so no flag is needed. Pass `"cute"` or
+`"triton"` to force one:
 
 ```python
 from megablocks.backend.grouped_moe import grouped_moe
@@ -94,7 +97,6 @@ output = grouped_moe(
     w_gate,
     w_up,
     w_down,
-    down_proj_backend="cute",
     recompute_activation=False,
 )
 ```
