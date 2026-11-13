@@ -426,7 +426,7 @@ def test_route_stats(token_rounding):
     nearest = token_rounding == 'nearest'
     out, stats = grouped_moe(
         x, top_w.flatten(), top_e.flatten().int(), plan, top_k, w_gate, w_up,
-        w_down, token_rounding=token_rounding,
+        w_down, down_proj_backend='triton', token_rounding=token_rounding,
         route_scores=scores.flatten() if nearest else None,
         return_route_stats=True)
     out.backward(dout)
@@ -633,3 +633,48 @@ def test_int64_expert_ids_raise():
     with pytest.raises(TypeError, match='int32'):
         grouped_moe(x, top_w.flatten(), top_e.flatten(), plan, 2,
                     w_gate, w_up, w_down)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize('hidden', [128, 512])
+def test_auto_matches_resolved_backend(hidden):
+    # 'auto' must run exactly the backend it resolves to.
+    top_k = 2
+    inputs = _inputs([128, 256] * 4, hidden, top_k, 100)
+    x, _, _, w_gate, w_up, w_down, _, _, _ = inputs
+    backend = grouped_moe_module._resolve_backend(x, w_gate, w_up, w_down)
+    if hidden == 128:
+        assert backend == 'triton'
+    want_out, want_grads = _step(inputs, top_k, backend)
+    out, grads = _step(inputs, top_k, 'auto')
+    assert torch.equal(out, want_out)
+    for name, got, want in zip(_GRAD_NAMES, grads, want_grads):
+        assert torch.equal(got, want), f'{name} differs bitwise'
+
+
+@pytest.mark.gpu
+def test_auto_resolution(monkeypatch):
+    dev = torch.device('cuda')
+
+    def resolve(hidden=512, dtype=torch.bfloat16):
+        x = torch.empty(4, hidden, device=dev, dtype=dtype)
+        w = torch.empty(hidden, 128, device=dev, dtype=dtype)
+        return grouped_moe_module._resolve_backend(x, w, w, w.T)
+
+    cute_ok = (importlib.util.find_spec('cutlass') is not None
+               and torch.cuda.get_device_capability()[0] == 8)
+    assert resolve() == ('cute' if cute_ok else 'triton')
+    assert resolve(hidden=128) == 'triton'
+    assert resolve(dtype=torch.float16) == 'triton'
+    monkeypatch.setattr(grouped_moe_module, '_cute_installed', lambda: False)
+    assert resolve() == 'triton'
+
+
+def test_rejects_unknown_backend():
+    plan = FusedMoEPlan.__new__(FusedMoEPlan)
+    plan.hidden_size, plan.block_n = 256, 128
+    x = torch.zeros(1, 256)
+    w = torch.zeros(256, 128)
+    with pytest.raises(ValueError, match="'auto', 'triton' or 'cute'"):
+        grouped_moe(x, torch.ones(1), torch.zeros(1, dtype=torch.int32), plan, 1,
+                    w, w, w.T, down_proj_backend='cuda')
