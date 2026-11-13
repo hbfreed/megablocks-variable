@@ -669,3 +669,108 @@ def test_unknown_backend_raises():
     with pytest.raises(ValueError, match="'auto', 'triton' or 'cute'"):
         grouped_moe(x, top_w.flatten(), top_e.flatten().int(), plan, 2,
                     w_gate, w_up, w_down, down_proj_backend='cuda')
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize('recompute_activation', [True, False])
+@pytest.mark.parametrize('token_rounding', ['ceil', 'nearest'])
+def test_custom_op_registration(token_rounding, recompute_activation):
+    # Schema, fake implementation and autograd registration of the forward op.
+    # opcheck's AOT test compares every output, and the row buffers the forward
+    # hands to backward hold unwritten padding rows, so the compile tests below
+    # check the outputs that matter instead.
+    top_k = 4
+    x, top_w, top_e, w_gate, w_up, w_down, _, plan, scores = _inputs(
+        [128, 256, 384, 512] * 4, 256, top_k, 33)
+    torch.library.opcheck(
+        grouped_moe_module._grouped_moe_fwd,
+        (x, top_w.flatten(), top_e.flatten().int(), w_gate, w_up, w_down,
+         scores.flatten() if token_rounding == 'nearest' else None,
+         plan.op_key, top_k, 'triton', recompute_activation, token_rounding,
+         True),
+        test_utils=('test_schema', 'test_autograd_registration',
+                    'test_faketensor'),
+    )
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize('down_proj_backend', ['triton', 'cute'])
+@pytest.mark.parametrize('token_rounding', ['ceil', 'nearest'])
+def test_compiled_matches_eager(down_proj_backend, token_rounding):
+    # torch.compile traces through grouped_moe without a graph break, and the
+    # compiled step computes exactly what the eager one does.
+    if down_proj_backend == 'cute':
+        _require_cute()
+    top_k = 8
+    inputs = _inputs([128, 256, 384, 512] * 16, 1024, top_k, 1024,
+                     renormalize=token_rounding == 'nearest')
+    x, top_w, top_e, w_gate, w_up, w_down, dout, plan, scores = inputs
+
+    def layer(x, top_w, top_e, scores):
+        # Elementwise work on both sides, which compile fuses around the op.
+        out = grouped_moe(x * 2, top_w.flatten(), top_e.flatten().int(), plan,
+                          top_k, w_gate, w_up, w_down, down_proj_backend,
+                          token_rounding=token_rounding,
+                          route_scores=(scores.flatten()
+                                        if token_rounding == 'nearest' else None))
+        return out + x
+
+    compiled = torch.compile(layer, fullgraph=True, dynamic=False)
+    leaves = (x, top_w, w_gate, w_up, w_down)
+    results = []
+    for fn in (layer, compiled):
+        out = fn(x, top_w, top_e, scores)
+        out.backward(dout)
+        results.append((out.detach(), [t.grad for t in leaves]))
+        for t in leaves:
+            t.grad = None
+    (want, want_grads), (got, got_grads) = results
+    assert torch.equal(got, want)
+    for name, g, w in zip(_GRAD_NAMES, got_grads, want_grads):
+        assert torch.equal(g, w), f'{name} differs bitwise'
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize('down_proj_backend', ['triton', 'cute'])
+def test_cuda_graph_replay(down_proj_backend):
+    # A captured forward + backward replays correctly after its inputs change in
+    # place, including the routing, so no size or launch depends on the host.
+    if down_proj_backend == 'cute':
+        _require_cute()
+    top_k = 8
+    inputs = _inputs([128, 256, 384, 512] * 16, 1024, top_k, 1024)
+    x, top_w, top_e, w_gate, w_up, w_down, dout, plan, scores = inputs
+    static_e = top_e.flatten().int()
+    leaves = (x, top_w, w_gate, w_up, w_down)
+
+    def step():
+        out = grouped_moe(x, top_w.flatten(), static_e, plan, top_k,
+                          w_gate, w_up, w_down, down_proj_backend)
+        out.backward(dout)
+        return out
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(3):  # compiles every kernel outside the capture
+            step()
+            for t in leaves:
+                t.grad = None
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        static_out = step()
+
+    for seed in (1, 2):
+        new = _inputs([128, 256, 384, 512] * 16, 1024, top_k, 1024, seed=seed)
+        with torch.no_grad():
+            for t, n in zip(leaves, (new[0], new[1], new[3], new[4], new[5])):
+                t.copy_(n)
+            static_e.copy_(new[2].flatten().int())
+            dout.copy_(new[6])
+        graph.replay()
+        got = static_out.clone(), [t.grad.clone() for t in leaves]
+        want_out, want_grads = _step(new, top_k, down_proj_backend)
+        assert torch.equal(got[0], want_out)
+        for name, g, w in zip(_GRAD_NAMES, got[1], want_grads):
+            assert torch.equal(g, w), f'{name} differs bitwise (seed {seed})'

@@ -34,6 +34,9 @@ checkpoint format already guarantees. The hidden size must be a multiple of 64
 and of the width block.
 """
 
+import itertools
+import weakref
+
 import torch
 import triton
 import triton.language as tl
@@ -235,6 +238,16 @@ def _down_proj(
              acc.to(y.dtype.element_ty))
 
 
+# Plans by key, so the grouped_moe custom ops can name one with an int. Weak, so
+# a plan still dies with its module.
+_PLANS = weakref.WeakValueDictionary()
+_PLAN_KEYS = itertools.count()
+
+
+def plan_by_key(key):
+    return _PLANS[key]
+
+
 def _next_pow2(n):
     return 1 << (n - 1).bit_length()
 
@@ -275,6 +288,8 @@ class FusedMoEPlan:
                                   device=device)
         self.cursor = torch.empty(self.num_experts, dtype=torch.int32,
                                   device=device)
+        self.op_key = next(_PLAN_KEYS)
+        _PLANS[self.op_key] = self
 
     def tile_config(self, num_tokens, top_k):
         """Row tile / warps / stages for this batch size.

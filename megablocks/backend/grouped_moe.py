@@ -59,13 +59,14 @@ experts get exact-zero grads rather than stale memory.
 """
 
 import functools
+from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
 
 from megablocks.backend import kernels
-from megablocks.backend.fused_moe import _down_proj, _plan_tiles
+from megablocks.backend.fused_moe import _down_proj, _plan_tiles, plan_by_key
 
 # Per-kernel launch configs, swept on a 3090 at the healing shape (keep50
 # widths, 4096 tokens, top_k 8), then partly retuned at 275 W on a synthetic table
@@ -810,381 +811,460 @@ def _wb_expert_table(plan, block_w):
     return table
 
 
-class _GroupedMoE(torch.autograd.Function):
+def _check_args(x, expert_ids, w_gate, w_up, w_down, plan, top_k,
+                down_proj_backend, recompute_activation, token_rounding,
+                route_scores):
+    """Validates grouped_moe's arguments and returns the resolved backend.
 
-    @staticmethod
-    def forward(
-        ctx,
-        x,
-        top_weights,
-        expert_ids,
-        w_gate,
-        w_up,
-        w_down,
-        plan,
-        top_k,
-        down_proj_backend,
-        recompute_activation,
-        token_rounding,
-        route_scores,
-        return_route_stats,
-    ):
-        # Every kernel addresses these with computed offsets.
-        x, top_weights, expert_ids = (x.contiguous(), top_weights.contiguous(),
-                                      expert_ids.contiguous())
-        w_gate, w_up, w_down = (w_gate.contiguous(), w_up.contiguous(),
-                                w_down.contiguous())
-        if route_scores is not None:
-            route_scores = route_scores.contiguous()
-        num_tokens, hidden = x.shape
-        num_routes = num_tokens * top_k
-        if hidden != plan.hidden_size:
-            raise ValueError(f'expected hidden {plan.hidden_size}, got {hidden}')
-        # The hidden tiles in _CFG must divide it, or part of the output and the
-        # weight gradients is never written.
-        if hidden != 128 and hidden % 256:
-            raise ValueError(f'hidden must be 128 or a multiple of 256, got {hidden}')
-        # The row-tile and weight-gradient kernels tile the width axis in 128s.
-        # A narrower width block runs tiles past an expert's width and leaves
-        # part of the weight gradients unwritten.
-        if plan.block_n % 128:
-            raise ValueError(
-                'the plan\'s width block must be a multiple of 128, got '
-                f'{plan.block_n}',
-            )
-        if expert_ids.numel() != num_routes:
-            raise ValueError(
-                f'expected {num_routes} expert ids, got {expert_ids.numel()}',
-            )
-        if expert_ids.dtype != torch.int32:
-            raise TypeError(f'expert_ids must be int32, got {expert_ids.dtype}')
-        if down_proj_backend not in ('auto', 'triton', 'cute'):
-            raise ValueError(
-                "down_proj_backend must be 'auto', 'triton' or 'cute', got "
-                f'{down_proj_backend!r}',
-            )
-        if down_proj_backend == 'auto':
-            down_proj_backend = _resolve_backend(x, w_gate, w_up, w_down)
-        if not isinstance(recompute_activation, bool):
-            raise TypeError('recompute_activation must be a bool')
-        if token_rounding not in ('ceil', 'nearest'):
-            raise ValueError(
-                "token_rounding must be 'ceil' or 'nearest', got "
-                f'{token_rounding!r}',
-            )
-        if route_scores is not None and route_scores.numel() != num_routes:
-            raise ValueError(
-                f'expected {num_routes} route scores, got {route_scores.numel()}',
-            )
+    Reads only shapes, dtypes and devices, so it also runs on the fake tensors
+    torch.compile traces with, and errors surface at trace time.
+    """
+    num_tokens, hidden = x.shape
+    num_routes = num_tokens * top_k
+    if hidden != plan.hidden_size:
+        raise ValueError(f'expected hidden {plan.hidden_size}, got {hidden}')
+    # The hidden tiles in _CFG must divide it, or part of the output and the
+    # weight gradients is never written.
+    if hidden != 128 and hidden % 256:
+        raise ValueError(f'hidden must be 128 or a multiple of 256, got {hidden}')
+    # The row-tile and weight-gradient kernels tile the width axis in 128s.
+    # A narrower width block runs tiles past an expert's width and leaves
+    # part of the weight gradients unwritten.
+    if plan.block_n % 128:
+        raise ValueError(
+            'the plan\'s width block must be a multiple of 128, got '
+            f'{plan.block_n}',
+        )
+    if expert_ids.numel() != num_routes:
+        raise ValueError(
+            f'expected {num_routes} expert ids, got {expert_ids.numel()}',
+        )
+    if expert_ids.dtype != torch.int32:
+        raise TypeError(f'expert_ids must be int32, got {expert_ids.dtype}')
+    if down_proj_backend not in ('auto', 'triton', 'cute'):
+        raise ValueError(
+            "down_proj_backend must be 'auto', 'triton' or 'cute', got "
+            f'{down_proj_backend!r}',
+        )
+    if down_proj_backend == 'auto':
+        down_proj_backend = _resolve_backend(x, w_gate, w_up, w_down)
+    if not isinstance(recompute_activation, bool):
+        raise TypeError('recompute_activation must be a bool')
+    if token_rounding not in ('ceil', 'nearest'):
+        raise ValueError(
+            "token_rounding must be 'ceil' or 'nearest', got "
+            f'{token_rounding!r}',
+        )
+    if route_scores is not None and route_scores.numel() != num_routes:
+        raise ValueError(
+            f'expected {num_routes} route scores, got {route_scores.numel()}',
+        )
+    return down_proj_backend
 
-        bn = plan.block_n
-        bm = _ROW_BLOCK
-        m_tiles, row_bound = plan.bounds(num_tokens, top_k, bm)
-        dev = x.device
 
-        stats = (torch.empty(2, dtype=torch.float32, device=dev)
-                 if return_route_stats else None)
-        tile_expert, route_tokens, route_rows, row_w = _route(
-            expert_ids, top_weights, plan, top_k, m_tiles, row_bound,
-            token_rounding, route_scores, stats)
-        # plan.counts / plan.expert_row_start are shared scratch that the next
-        # forward overwrites; backward needs this call's values.
-        counts = plan.counts.clone()
-        row_start = plan.expert_row_start.clone()
+def _forward_impl(x, top_weights, expert_ids, w_gate, w_up, w_down,
+                  route_scores, plan, top_k, down_proj_backend,
+                  recompute_activation, token_rounding, return_route_stats):
+    # Every kernel addresses these with computed offsets.
+    x, top_weights, expert_ids = (x.contiguous(), top_weights.contiguous(),
+                                  expert_ids.contiguous())
+    w_gate, w_up, w_down = (w_gate.contiguous(), w_up.contiguous(),
+                            w_down.contiguous())
+    if route_scores is not None:
+        route_scores = route_scores.contiguous()
+    num_tokens, hidden = x.shape
 
-        g = torch.empty((row_bound, plan.max_width), dtype=x.dtype, device=dev)
-        u = torch.empty((row_bound, plan.max_width), dtype=x.dtype, device=dev)
-        h = torch.empty_like(g)
-        # 16 byte cp.async needs 16 byte aligned x rows and weights, which only
-        # hand-built tensors can miss. The Triton kernels take that case and
-        # other width blocks.
-        if (down_proj_backend == 'cute' and bn == 128
-                and all(t.data_ptr() % 16 == 0 for t in (x, w_gate, w_up))):
-            from megablocks.backend.cute_down_proj import cute_gate_up_rows
+    bn = plan.block_n
+    bm = _ROW_BLOCK
+    m_tiles, row_bound = plan.bounds(num_tokens, top_k, bm)
+    dev = x.device
 
-            cute_gate_up_rows(
+    stats = (torch.empty(2, dtype=torch.float32, device=dev)
+             if return_route_stats else None)
+    tile_expert, route_tokens, route_rows, row_w = _route(
+        expert_ids, top_weights, plan, top_k, m_tiles, row_bound,
+        token_rounding, route_scores, stats)
+    # plan.counts / plan.expert_row_start are shared scratch that the next
+    # forward overwrites; backward needs this call's values.
+    counts = plan.counts.clone()
+    row_start = plan.expert_row_start.clone()
+
+    g = torch.empty((row_bound, plan.max_width), dtype=x.dtype, device=dev)
+    u = torch.empty((row_bound, plan.max_width), dtype=x.dtype, device=dev)
+    h = torch.empty_like(g)
+    # 16 byte cp.async needs 16 byte aligned x rows and weights, which only
+    # hand-built tensors can miss. The Triton kernels take that case and
+    # other width blocks.
+    if (down_proj_backend == 'cute' and bn == 128
+            and all(t.data_ptr() % 16 == 0 for t in (x, w_gate, w_up))):
+        from megablocks.backend.cute_down_proj import cute_gate_up_rows
+
+        cute_gate_up_rows(
+            x,
+            w_gate,
+            w_up,
+            g,
+            u,
+            h,
+            row_w,
+            route_tokens,
+            tile_expert,
+            plan.expert_col_off,
+            plan.expert_nblocks,
+            bn,
+        )
+    else:
+        for w, out, fuse_silu in (
+            (w_gate, g, False),
+            (w_up, u, True),
+        ):
+            pm, pn, pk, pw, ps = _CFG[
+                'proj_fused' if fuse_silu else 'proj'
+            ]
+            proj_grid = ((plan.max_width + pn - 1) // pn, m_tiles)
+            _proj_rows[proj_grid](
                 x,
-                w_gate,
-                w_up,
+                w,
+                out,
                 g,
-                u,
                 h,
                 row_w,
                 route_tokens,
                 tile_expert,
                 plan.expert_col_off,
                 plan.expert_nblocks,
-                bn,
-            )
-        else:
-            for w, out, fuse_silu in (
-                (w_gate, g, False),
-                (w_up, u, True),
-            ):
-                pm, pn, pk, pw, ps = _CFG[
-                    'proj_fused' if fuse_silu else 'proj'
-                ]
-                proj_grid = ((plan.max_width + pn - 1) // pn, m_tiles)
-                _proj_rows[proj_grid](
-                    x,
-                    w,
-                    out,
-                    g,
-                    h,
-                    row_w,
-                    route_tokens,
-                    tile_expert,
-                    plan.expert_col_off,
-                    plan.expert_nblocks,
-                    HIDDEN=hidden,
-                    TOTAL_W=plan.total_width,
-                    MAX_W=plan.max_width,
-                    WIDTH_BLOCK=bn,
-                    BLOCK_M=pm,
-                    BLOCK_N=pn,
-                    BLOCK_K=pk,
-                    FUSE_SILU=fuse_silu,
-                    num_warps=pw,
-                    num_stages=ps,
-                )
-
-        dm, dn, dk, dw_, ds = _CFG['down']
-        dn = min(dn, hidden)
-        y = torch.empty((row_bound, hidden), dtype=x.dtype, device=dev)
-        if down_proj_backend == 'cute':
-            # Lazy import keeps CUTLASS DSL entirely optional for the default
-            # Triton path (and avoids its import cost during normal startup).
-            from megablocks.backend.cute_down_proj import cute_down_proj
-
-            cute_down_proj(
-                h,
-                w_down,
-                y,
-                tile_expert,
-                plan.expert_col_off,
-                plan.expert_nblocks,
-                bn,
-            )
-        elif down_proj_backend == 'triton':
-            _down_proj[(m_tiles, hidden // dn)](
-                h,
-                w_down,
-                y,
-                tile_expert,
-                plan.expert_col_off,
-                plan.expert_nblocks,
                 HIDDEN=hidden,
+                TOTAL_W=plan.total_width,
                 MAX_W=plan.max_width,
                 WIDTH_BLOCK=bn,
-                BLOCK_M=dm,
-                BLOCK_N=dn,
-                BLOCK_K=dk,
-                num_warps=dw_,
-                num_stages=ds,
+                BLOCK_M=pm,
+                BLOCK_N=pn,
+                BLOCK_K=pk,
+                FUSE_SILU=fuse_silu,
+                num_warps=pw,
+                num_stages=ps,
             )
-        saved_h = None if recompute_activation else h
-        if recompute_activation:
-            del h
 
-        out = torch.empty((num_tokens, hidden), dtype=x.dtype, device=dev)
-        kernels._scatter_reduce[(num_tokens,)](
-            out,
-            y,
-            route_rows,
-            None,
-            NUM_COLUMNS=hidden,
-            TOP_K=top_k,
-            SCALE=False,
-        )
+    dm, dn, dk, dw_, ds = _CFG['down']
+    dn = min(dn, hidden)
+    y = torch.empty((row_bound, hidden), dtype=x.dtype, device=dev)
+    if down_proj_backend == 'cute':
+        # Lazy import keeps CUTLASS DSL entirely optional for the default
+        # Triton path (and avoids its import cost during normal startup).
+        from megablocks.backend.cute_down_proj import cute_down_proj
 
-        saved = (x, top_weights, w_gate, w_up, w_down,
-                 route_tokens, route_rows, tile_expert,
-                 counts, row_start, g, u, row_w)
-        if saved_h is not None:
-            saved += (saved_h,)
-        ctx.save_for_backward(*saved)
-        ctx.plan = plan
-        ctx.top_k = top_k
-        ctx.launch = (m_tiles, row_bound)
-        ctx.down_proj_backend = down_proj_backend
-        ctx.recompute_activation = recompute_activation
-        if stats is None:
-            return out
-        ctx.mark_non_differentiable(stats)
-        return out, stats
-
-    @staticmethod
-    def backward(ctx, dout, *_):
-        (x, top_weights, w_gate, w_up, w_down,
-         route_tokens, route_rows, tile_expert,
-         counts, row_start, g, u, row_w) = ctx.saved_tensors[:13]
-        plan, top_k = ctx.plan, ctx.top_k
-        m_tiles, row_bound = ctx.launch
-        num_tokens, hidden = x.shape
-        num_routes = num_tokens * top_k
-        bn = plan.block_n
-        dev = x.device
-        dout = dout.contiguous()
-
-        gm, gn, gk, gw, gs = _CFG['dgu']
-        dg = torch.empty_like(g)
-        du = torch.empty_like(u)
-        dgu_nt = (plan.max_width + gn - 1) // gn
-        dw_part = torch.zeros((row_bound, dgu_nt), dtype=torch.float32,
-                              device=dev)
-        # Transient when recomputed. Only the weight gradient reads h, and only
-        # inside each expert's rows and width, which is what _dgu tiles over.
-        h = (
-            torch.empty_like(g)
-            if ctx.recompute_activation
-            else ctx.saved_tensors[13]
-        )
-        _dgu[(dgu_nt, m_tiles)](
-            dout,
-            w_down,
-            g,
-            u,
-            row_w,
-            dg,
-            du,
-            dw_part,
+        cute_down_proj(
             h,
-            route_tokens,
+            w_down,
+            y,
+            tile_expert,
+            plan.expert_col_off,
+            plan.expert_nblocks,
+            bn,
+        )
+    elif down_proj_backend == 'triton':
+        _down_proj[(m_tiles, hidden // dn)](
+            h,
+            w_down,
+            y,
             tile_expert,
             plan.expert_col_off,
             plan.expert_nblocks,
             HIDDEN=hidden,
             MAX_W=plan.max_width,
-            NUM_NT=dgu_nt,
             WIDTH_BLOCK=bn,
-            BLOCK_M=gm,
-            BLOCK_N=gn,
-            BLOCK_K=gk,
-            FUSE_H=ctx.recompute_activation,
-            num_warps=gw,
-            num_stages=gs,
+            BLOCK_M=dm,
+            BLOCK_N=dn,
+            BLOCK_K=dk,
+            num_warps=dw_,
+            num_stages=ds,
         )
-        dw_routes = torch.empty(num_routes, dtype=torch.float32, device=dev)
-        _route_dw[(triton.cdiv(num_routes, 256),)](
-            dw_routes,
-            dw_part,
-            route_rows,
-            num_routes,
-            NUM_NT=dgu_nt,
-            BLOCK_NT=triton.next_power_of_2(dgu_nt),
-            BLOCK_X=256,
-            num_warps=4,
-        )
-
-        ww, wh, wk, wwar, wst = _CFG['wgrad_down']
-        dwd = torch.empty_like(w_down)
-        if ctx.down_proj_backend == 'cute':
-            from megablocks.backend.cute_down_proj import cute_wgrad_rows
-
-            cute_wgrad_rows(
-                h,
-                dout,
-                route_tokens,
-                dwd,
-                _wb_expert_table(plan, 128),
-                plan.expert_col_off,
-                counts,
-                row_start,
-            )
-        else:
-            _wgrad_rows[(hidden // wh, plan.total_width // ww)](
-                h,
-                dout,
-                dwd,
-                route_tokens,
-                _wb_expert_table(plan, ww),
-                plan.expert_col_off,
-                row_start,
-                counts,
-                HIDDEN=hidden,
-                MAX_W=plan.max_width,
-                BLOCK_W=ww,
-                BLOCK_H=wh,
-                BLOCK_K=wk,
-                num_warps=wwar,
-                num_stages=wst,
-            )
+    saved_h = None if recompute_activation else h
+    if recompute_activation:
         del h
 
-        ww, wh, wk, wwar, wst = _CFG['wgrad_gateup']
-        wb_expert = _wb_expert_table(plan, ww)
-        dwg = torch.empty_like(w_gate)
-        dwu = torch.empty_like(w_up)
-        for d_rows, dw in ((dg, dwg), (du, dwu)):
-            _wgrad_gather[(hidden // wh, plan.total_width // ww)](
-                x,
-                d_rows,
-                dw,
-                route_tokens,
-                wb_expert,
-                plan.expert_col_off,
-                row_start,
-                counts,
-                HIDDEN=hidden,
-                TOTAL_W=plan.total_width,
-                MAX_W=plan.max_width,
-                BLOCK_W=ww,
-                BLOCK_H=wh,
-                BLOCK_K=wk,
-                num_warps=wwar,
-                num_stages=wst,
-            )
+    out = torch.empty((num_tokens, hidden), dtype=x.dtype, device=dev)
+    kernels._scatter_reduce[(num_tokens,)](
+        out,
+        y,
+        route_rows,
+        None,
+        NUM_COLUMNS=hidden,
+        TOP_K=top_k,
+        SCALE=False,
+    )
 
-        dx_rows = torch.empty((row_bound, hidden), dtype=x.dtype, device=dev)
-        if ctx.down_proj_backend == 'cute':
-            from megablocks.backend.cute_down_proj import cute_dx_proj_fused
+    # A custom op returns fixed outputs, so the absent ones are empty.
+    empty = x.new_empty(0)
+    return (out, empty.float() if stats is None else stats,
+            route_tokens, route_rows, tile_expert, counts, row_start,
+            g, u, row_w, empty if saved_h is None else saved_h)
 
-            cute_dx_proj_fused(
-                dg,
-                du,
-                w_gate,
-                w_up,
-                dx_rows,
-                tile_expert,
-                plan.expert_col_off,
-                plan.expert_nblocks,
-                bn,
-            )
-        else:
-            xm, xn, xk, xw, xs = _CFG['dx_fused']
-            xn = min(xn, hidden)
-            _dx_rows_fused[(hidden // xn, m_tiles)](
-                dg,
-                du,
-                w_gate,
-                w_up,
-                dx_rows,
-                tile_expert,
-                plan.expert_col_off,
-                plan.expert_nblocks,
-                HIDDEN=hidden,
-                TOTAL_W=plan.total_width,
-                MAX_W=plan.max_width,
-                WIDTH_BLOCK=bn,
-                BLOCK_M=xm,
-                BLOCK_N=xn,
-                BLOCK_K=xk,
-                num_warps=xw,
-                num_stages=xs,
-            )
-        dx = torch.empty_like(x)
-        kernels._scatter_reduce[(num_tokens,)](
-            dx,
-            dx_rows,
-            route_rows,
-            None,
-            NUM_COLUMNS=hidden,
-            TOP_K=top_k,
-            SCALE=False,
+
+def _backward_impl(dout, x, top_weights, w_gate, w_up, w_down,
+                   route_tokens, route_rows, tile_expert, counts, row_start,
+                   g, u, row_w, saved_h, plan, top_k, down_proj_backend,
+                   recompute_activation):
+    x, top_weights = x.contiguous(), top_weights.contiguous()
+    w_gate, w_up, w_down = (w_gate.contiguous(), w_up.contiguous(),
+                            w_down.contiguous())
+    num_tokens, hidden = x.shape
+    m_tiles, row_bound = tile_expert.numel(), route_tokens.numel()
+    num_routes = num_tokens * top_k
+    bn = plan.block_n
+    dev = x.device
+    dout = dout.contiguous()
+
+    gm, gn, gk, gw, gs = _CFG['dgu']
+    dg = torch.empty_like(g)
+    du = torch.empty_like(u)
+    dgu_nt = (plan.max_width + gn - 1) // gn
+    dw_part = torch.zeros((row_bound, dgu_nt), dtype=torch.float32,
+                          device=dev)
+    # Transient when recomputed. Only the weight gradient reads h, and only
+    # inside each expert's rows and width, which is what _dgu tiles over.
+    h = (
+        torch.empty_like(g)
+        if recompute_activation
+        else saved_h
+    )
+    _dgu[(dgu_nt, m_tiles)](
+        dout,
+        w_down,
+        g,
+        u,
+        row_w,
+        dg,
+        du,
+        dw_part,
+        h,
+        route_tokens,
+        tile_expert,
+        plan.expert_col_off,
+        plan.expert_nblocks,
+        HIDDEN=hidden,
+        MAX_W=plan.max_width,
+        NUM_NT=dgu_nt,
+        WIDTH_BLOCK=bn,
+        BLOCK_M=gm,
+        BLOCK_N=gn,
+        BLOCK_K=gk,
+        FUSE_H=recompute_activation,
+        num_warps=gw,
+        num_stages=gs,
+    )
+    dw_routes = torch.empty(num_routes, dtype=torch.float32, device=dev)
+    _route_dw[(triton.cdiv(num_routes, 256),)](
+        dw_routes,
+        dw_part,
+        route_rows,
+        num_routes,
+        NUM_NT=dgu_nt,
+        BLOCK_NT=triton.next_power_of_2(dgu_nt),
+        BLOCK_X=256,
+        num_warps=4,
+    )
+
+    ww, wh, wk, wwar, wst = _CFG['wgrad_down']
+    dwd = torch.empty_like(w_down)
+    if down_proj_backend == 'cute':
+        from megablocks.backend.cute_down_proj import cute_wgrad_rows
+
+        cute_wgrad_rows(
+            h,
+            dout,
+            route_tokens,
+            dwd,
+            _wb_expert_table(plan, 128),
+            plan.expert_col_off,
+            counts,
+            row_start,
+        )
+    else:
+        _wgrad_rows[(hidden // wh, plan.total_width // ww)](
+            h,
+            dout,
+            dwd,
+            route_tokens,
+            _wb_expert_table(plan, ww),
+            plan.expert_col_off,
+            row_start,
+            counts,
+            HIDDEN=hidden,
+            MAX_W=plan.max_width,
+            BLOCK_W=ww,
+            BLOCK_H=wh,
+            BLOCK_K=wk,
+            num_warps=wwar,
+            num_stages=wst,
+        )
+    del h
+
+    ww, wh, wk, wwar, wst = _CFG['wgrad_gateup']
+    wb_expert = _wb_expert_table(plan, ww)
+    dwg = torch.empty_like(w_gate)
+    dwu = torch.empty_like(w_up)
+    for d_rows, dw in ((dg, dwg), (du, dwu)):
+        _wgrad_gather[(hidden // wh, plan.total_width // ww)](
+            x,
+            d_rows,
+            dw,
+            route_tokens,
+            wb_expert,
+            plan.expert_col_off,
+            row_start,
+            counts,
+            HIDDEN=hidden,
+            TOTAL_W=plan.total_width,
+            MAX_W=plan.max_width,
+            BLOCK_W=ww,
+            BLOCK_H=wh,
+            BLOCK_K=wk,
+            num_warps=wwar,
+            num_stages=wst,
         )
 
-        return (dx, dw_routes.to(top_weights.dtype), None,
-                dwg, dwu, dwd, None, None, None, None, None, None, None)
+    dx_rows = torch.empty((row_bound, hidden), dtype=x.dtype, device=dev)
+    if down_proj_backend == 'cute':
+        from megablocks.backend.cute_down_proj import cute_dx_proj_fused
+
+        cute_dx_proj_fused(
+            dg,
+            du,
+            w_gate,
+            w_up,
+            dx_rows,
+            tile_expert,
+            plan.expert_col_off,
+            plan.expert_nblocks,
+            bn,
+        )
+    else:
+        xm, xn, xk, xw, xs = _CFG['dx_fused']
+        xn = min(xn, hidden)
+        _dx_rows_fused[(hidden // xn, m_tiles)](
+            dg,
+            du,
+            w_gate,
+            w_up,
+            dx_rows,
+            tile_expert,
+            plan.expert_col_off,
+            plan.expert_nblocks,
+            HIDDEN=hidden,
+            TOTAL_W=plan.total_width,
+            MAX_W=plan.max_width,
+            WIDTH_BLOCK=bn,
+            BLOCK_M=xm,
+            BLOCK_N=xn,
+            BLOCK_K=xk,
+            num_warps=xw,
+            num_stages=xs,
+        )
+    dx = torch.empty_like(x)
+    kernels._scatter_reduce[(num_tokens,)](
+        dx,
+        dx_rows,
+        route_rows,
+        None,
+        NUM_COLUMNS=hidden,
+        TOP_K=top_k,
+        SCALE=False,
+    )
+
+    return (dx, dw_routes.to(top_weights.dtype).view(top_weights.shape),
+            dwg, dwu, dwd)
+
+
+# The forward and backward are torch.library custom ops, so torch.compile traces
+# through grouped_moe as two opaque nodes instead of breaking the graph at it, and
+# a CUDA graph can capture the whole layer. A plan is not a tensor, so the ops
+# take its key in fused_moe's plan registry. The forward also returns what the
+# backward needs; an absent output (stats, a recomputed h) is an empty tensor.
+_Tensor = torch.Tensor
+
+
+@torch.library.custom_op('megablocks::grouped_moe_fwd', mutates_args=())
+def _grouped_moe_fwd(
+    x: _Tensor, top_weights: _Tensor, expert_ids: _Tensor, w_gate: _Tensor,
+    w_up: _Tensor, w_down: _Tensor, route_scores: Optional[_Tensor],
+    plan_key: int, top_k: int, down_proj_backend: str,
+    recompute_activation: bool, token_rounding: str, return_route_stats: bool,
+) -> tuple[_Tensor, _Tensor, _Tensor, _Tensor, _Tensor, _Tensor, _Tensor,
+           _Tensor, _Tensor, _Tensor, _Tensor]:
+    return _forward_impl(x, top_weights, expert_ids, w_gate, w_up, w_down,
+                         route_scores, plan_by_key(plan_key), top_k,
+                         down_proj_backend, recompute_activation,
+                         token_rounding, return_route_stats)
+
+
+@_grouped_moe_fwd.register_fake
+def _(x, top_weights, expert_ids, w_gate, w_up, w_down, route_scores,
+      plan_key, top_k, down_proj_backend, recompute_activation,
+      token_rounding, return_route_stats):
+    plan = plan_by_key(plan_key)
+    num_tokens, hidden = x.shape
+    m_tiles, row_bound = plan.bounds(num_tokens, top_k, _ROW_BLOCK)
+    i32 = dict(dtype=torch.int32, device=x.device)
+    rows = x.new_empty((row_bound, plan.max_width))
+    return (x.new_empty((num_tokens, hidden)),
+            x.new_empty(2 if return_route_stats else 0, dtype=torch.float32),
+            torch.empty(row_bound, **i32),
+            torch.empty(num_tokens * top_k, **i32),
+            torch.empty(m_tiles, **i32),
+            torch.empty(plan.num_experts, **i32),
+            torch.empty(plan.num_experts, **i32),
+            rows, torch.empty_like(rows),
+            x.new_empty(row_bound, dtype=torch.float32),
+            x.new_empty(0) if recompute_activation else torch.empty_like(rows))
+
+
+@torch.library.custom_op('megablocks::grouped_moe_bwd', mutates_args=())
+def _grouped_moe_bwd(
+    dout: _Tensor, x: _Tensor, top_weights: _Tensor, w_gate: _Tensor,
+    w_up: _Tensor, w_down: _Tensor, route_tokens: _Tensor,
+    route_rows: _Tensor, tile_expert: _Tensor, counts: _Tensor,
+    row_start: _Tensor, g: _Tensor, u: _Tensor, row_w: _Tensor,
+    saved_h: _Tensor, plan_key: int, top_k: int, down_proj_backend: str,
+    recompute_activation: bool,
+) -> tuple[_Tensor, _Tensor, _Tensor, _Tensor, _Tensor]:
+    return _backward_impl(dout, x, top_weights, w_gate, w_up, w_down,
+                          route_tokens, route_rows, tile_expert, counts,
+                          row_start, g, u, row_w, saved_h,
+                          plan_by_key(plan_key), top_k, down_proj_backend,
+                          recompute_activation)
+
+
+@_grouped_moe_bwd.register_fake
+def _(dout, x, top_weights, w_gate, w_up, w_down, *_):
+    return (torch.empty_like(x), torch.empty_like(top_weights),
+            torch.empty_like(w_gate), torch.empty_like(w_up),
+            torch.empty_like(w_down))
+
+
+def _setup_context(ctx, inputs, output):
+    (x, top_weights, _, w_gate, w_up, w_down, _, plan_key, top_k,
+     down_proj_backend, recompute_activation, _, _) = inputs
+    (_, stats, route_tokens, route_rows, tile_expert, counts, row_start,
+     g, u, row_w, saved_h) = output
+    ctx.mark_non_differentiable(stats, g, u, row_w, saved_h)
+    # Otherwise autograd fills a zero gradient for every output backward
+    # ignores, the row buffers included: 0.2 ms and 157 MiB at the benchmark
+    # shape.
+    ctx.set_materialize_grads(False)
+    ctx.save_for_backward(x, top_weights, w_gate, w_up, w_down,
+                          route_tokens, route_rows, tile_expert, counts,
+                          row_start, g, u, row_w, saved_h)
+    ctx.args = (plan_key, top_k, down_proj_backend, recompute_activation)
+
+
+def _backward(ctx, dout, *_):
+    dx, dtw, dwg, dwu, dwd = _grouped_moe_bwd(dout, *ctx.saved_tensors,
+                                              *ctx.args)
+    return (dx, dtw, None, dwg, dwu, dwd) + (None,) * 7
+
+
+_grouped_moe_fwd.register_autograd(_backward, setup_context=_setup_context)
 
 
 def grouped_moe(
@@ -1235,14 +1315,15 @@ def grouped_moe(
     gpt_model.MoEMLP's names -- to 0-dim float32 tensors left on the device,
     so logging them does not synchronize.
     """
-    result = _GroupedMoE.apply(x, top_weights, expert_ids,
-                               w_gate, w_up, w_down, plan, top_k,
-                               down_proj_backend, recompute_activation,
-                               token_rounding, route_scores,
-                               return_route_stats)
+    backend = _check_args(x, expert_ids, w_gate, w_up, w_down, plan, top_k,
+                          down_proj_backend, recompute_activation,
+                          token_rounding, route_scores)
+    out, stats, *_ = _grouped_moe_fwd(
+        x, top_weights, expert_ids, w_gate, w_up, w_down, route_scores,
+        plan.op_key, top_k, backend, recompute_activation, token_rounding,
+        return_route_stats)
     if not return_route_stats:
-        return result
-    out, stats = result
+        return out
     return out, {
         'dropped_route_fraction': stats[0],
         'padding_route_fraction': stats[1],
