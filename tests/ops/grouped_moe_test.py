@@ -469,24 +469,27 @@ def test_route_stats(token_rounding):
 def test_cute_short_k_loop():
     # One K tile with three pipeline stages: the prologue must still commit one
     # cp.async group per stage, or its wait passes with data in flight. A 32-wide
-    # expert under block_n 32 reaches that, and it returned 32% error before.
+    # expert under a 32 width block reaches that, and it returned 32% error
+    # before. grouped_moe needs 128-wide blocks, so this drives the kernel directly.
     _require_cute()
+    from megablocks.backend.cute_down_proj import cute_down_proj
+
     torch.manual_seed(0)
     dev = torch.device('cuda')
-    widths, hidden, top_k, num_tokens = [32, 128], 256, 2, 200
-    total = sum(widths)
-    x = torch.randn(num_tokens, hidden, device=dev, dtype=torch.bfloat16)
-    w_gate = torch.randn(hidden, total, device=dev, dtype=torch.bfloat16) * 0.05
-    w_up = torch.randn(hidden, total, device=dev, dtype=torch.bfloat16) * 0.05
-    w_down = torch.randn(total, hidden, device=dev, dtype=torch.bfloat16) * 0.05
-    top_e = torch.tensor([[0, 1]] * num_tokens, device=dev)
-    top_w = torch.full((num_tokens, top_k), 0.5, device=dev, dtype=torch.bfloat16)
+    widths, hidden = [32, 128], 256
     plan = FusedMoEPlan(widths, hidden, dev, block_n=32)
-    want = _reference(x, top_w, top_e, w_gate, w_up, w_down, widths)
+    w_down = torch.randn(sum(widths), hidden, device=dev, dtype=torch.bfloat16) * 0.05
+    # One 128-row tile per expert; columns past an expert's width hold values
+    # the kernel must not read.
+    h = torch.randn(256, plan.max_width, device=dev, dtype=torch.bfloat16)
+    tile_expert = torch.tensor([0, 1], device=dev, dtype=torch.int32)
+    want = torch.cat((h[:128, :32].float() @ w_down[:32].float(),
+                      h[128:].float() @ w_down[32:].float()))
     for _ in range(3):
-        out = grouped_moe(x, top_w.flatten(), top_e.flatten().int(), plan, top_k,
-                          w_gate, w_up, w_down, down_proj_backend='cute')
-        assert _rel(out, want) < 1e-2
+        y = torch.empty(256, hidden, device=dev, dtype=torch.bfloat16)
+        cute_down_proj(h, w_down, y, tile_expert, plan.expert_col_off,
+                       plan.expert_nblocks, plan.block_n)
+        assert _rel(y, want) < 1e-2
 
 
 @pytest.mark.gpu
@@ -624,3 +627,28 @@ def test_nearest_keeps_experts_under_half_a_tile(widths, hidden, top_k, num_toke
     if int(counts.max()) < 64:
         assert stats['dropped_route_fraction'].item() == 0.0
     _assert_close(_run(widths, hidden, top_k, num_tokens, token_rounding='nearest'))
+
+
+@pytest.mark.gpu
+@pytest.mark.world_size(1)
+@pytest.mark.parametrize('widths, block_n', [([32, 128], 32), ([64, 128, 192], 64)])
+def test_narrow_width_block_raises(widths, block_n):
+    # The row-tile and weight-gradient kernels tile the width axis in 128s. Under
+    # a narrower block they returned a wrong output and garbage weight gradients.
+    x, top_w, top_e, w_gate, w_up, w_down, _, plan, _ = _inputs(
+        widths, 256, 2, 20, block_n=block_n)
+    with pytest.raises(ValueError, match='multiple of 128'):
+        grouped_moe(x, top_w.flatten(), top_e.flatten().int(), plan, 2,
+                    w_gate, w_up, w_down)
+
+
+@pytest.mark.gpu
+@pytest.mark.world_size(1)
+def test_int64_expert_ids_raise():
+    # topk returns int64 indices, and the routing kernels failed to compile on
+    # them with a Triton compiler dump instead of an error.
+    x, top_w, top_e, w_gate, w_up, w_down, _, plan, _ = _inputs(
+        [128, 256], 256, 2, 20)
+    with pytest.raises(TypeError, match='int32'):
+        grouped_moe(x, top_w.flatten(), top_e.flatten(), plan, 2,
+                    w_gate, w_up, w_down)

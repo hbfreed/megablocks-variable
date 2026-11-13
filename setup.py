@@ -1,11 +1,14 @@
 # Copyright 2024 Databricks
 # SPDX-License-Identifier: Apache-2.0
 
-"""MegaBlocks package setup."""
+"""MegaBlocks package setup.
+
+The project metadata (name, version, dependencies, extras) lives in
+pyproject.toml. This file only adds the optional CUDA extension.
+"""
 
 import os
 import warnings
-from typing import Any, Dict, Mapping
 
 from setuptools import find_packages, setup
 
@@ -16,79 +19,6 @@ try:
     from torch.utils.cpp_extension import CUDA_HOME, BuildExtension, CUDAExtension
 except ModuleNotFoundError as e:
     raise ModuleNotFoundError("No module named 'torch'. `torch` is required to install `MegaBlocks`.",) from e
-
-_PACKAGE_NAME = 'megablocks'
-_PACKAGE_DIR = 'megablocks'
-_REPO_REAL_PATH = os.path.dirname(os.path.realpath(__file__))
-_PACKAGE_REAL_PATH = os.path.join(_REPO_REAL_PATH, _PACKAGE_DIR)
-
-# Read the package version
-# We can't use `.__version__` from the library since it's not installed yet
-version_path = os.path.join(_PACKAGE_REAL_PATH, '_version.py')
-with open(version_path, encoding='utf-8') as f:
-    version_globals: Dict[str, Any] = {}
-    version_locals: Mapping[str, object] = {}
-    content = f.read()
-    exec(content, version_globals, version_locals)
-    repo_version = version_locals['__version__']
-
-with open('README.md', 'r', encoding='utf-8') as fh:
-    long_description = fh.read()
-
-# Hide the content between <!-- SETUPTOOLS_LONG_DESCRIPTION_HIDE_BEGIN --> and
-# <!-- SETUPTOOLS_LONG_DESCRIPTION_HIDE_END --> tags in the README
-while True:
-    start_tag = '<!-- SETUPTOOLS_LONG_DESCRIPTION_HIDE_BEGIN -->'
-    end_tag = '<!-- SETUPTOOLS_LONG_DESCRIPTION_HIDE_END -->'
-    start = long_description.find(start_tag)
-    end = long_description.find(end_tag)
-    if start == -1:
-        assert end == -1, 'there should be a balanced number of start and ends'
-        break
-    else:
-        assert end != -1, 'there should be a balanced number of start and ends'
-        long_description = long_description[:start] + \
-            long_description[end + len(end_tag):]
-
-classifiers = [
-    'Programming Language :: Python :: 3',
-    'Programming Language :: Python :: 3.10',
-    'Programming Language :: Python :: 3.11',
-    'License :: OSI Approved :: BSD License',
-    'Operating System :: Unix',
-]
-
-install_requires = [
-    'numpy>=1.21.5,<2.1.0',
-    'packaging>=21.3.0',
-    'torch>=2.11.0,<2.13',
-    'stanford-stk==0.7.1',
-]
-
-extra_deps = {}
-
-extra_deps['gg'] = [
-    'grouped_gemm==0.3.0',
-]
-
-extra_deps['cute'] = [
-    'nvidia-cutlass-dsl>=4.6.0,<4.7',
-    'apache-tvm-ffi>=0.1.0,<0.2',
-]
-
-extra_deps['dev'] = [
-    'absl-py',  # TODO: delete when finish removing all absl tests
-    'coverage[toml]==7.4.4',
-    'pytest_codeblocks>=0.16.1,<0.17',
-    'pytest-cov>=4,<5',
-    'pytest>=7.2.1,<8',
-    'pre-commit>=3.4.0,<4',
-]
-
-extra_deps['testing'] = [
-]
-
-extra_deps['all'] = list({dep for key, deps in extra_deps.items() for dep in deps if key not in {'testing'}})
 
 cmdclass = {}
 ext_modules = []
@@ -131,27 +61,8 @@ elif build_extensions:
     warnings.warn('Warning: No CUDA devices; cuda code will not be compiled.')
 
 setup(
-    name=_PACKAGE_NAME,
-    version=repo_version,
-    author='Trevor Gale',
-    author_email='tgale@stanford.edu',
-    maintainer='Henry Freed',
-    maintainer_email='hbfreed@protonmail.com',
-    description='GPU kernels for variable-width mixture-of-experts inference and training',
-    long_description=long_description,
-    long_description_content_type='text/markdown',
-    url='https://github.com/hbfreed/megablocks-variable',
-    project_urls={
-        'Issues': 'https://github.com/hbfreed/megablocks-variable/issues',
-        'Source': 'https://github.com/hbfreed/megablocks-variable',
-        'Upstream': 'https://github.com/databricks/megablocks',
-    },
-    classifiers=classifiers,
-    packages=find_packages(exclude=['tests*', 'third_party*', 'yamls*', 'exp*', '.github*']),
+    packages=find_packages(exclude=['tests*', 'third_party*', 'exp*', '.github*']),
     ext_modules=ext_modules,
     cmdclass=cmdclass,
-    install_requires=install_requires,
-    extras_require=extra_deps,
-    python_requires='>=3.10',
-    package_data={_PACKAGE_NAME: ['py.typed']},
+    package_data={'megablocks': ['py.typed']},
 )

@@ -4,6 +4,7 @@
 import pytest
 import torch
 
+import gpt_model
 from gpt_model import GPTConfig, MoEMLP
 from megablocks import ops
 
@@ -98,6 +99,8 @@ def test_dropped_routes_are_zero_in_forward_and_backward(top_k: int):
 @pytest.mark.world_size(1)
 def test_nearest_rounding_runs_full_moe_forward_and_backward():
     """Exercise score sorting, rounded topology, and dropped-route gradients together."""
+    if gpt_model.nanomoe_ops is None:
+        pytest.skip("the nanomoe_ops extension is not built for this torch")
     torch.manual_seed(0)
     moe = MoEMLP(
         GPTConfig(

@@ -23,10 +23,12 @@ from einops import rearrange
 from megablocks import ops
 from megablocks.layers.relu_squared import relu_squared
 
-# Import nanomoe_ops for variable-size topology
+# nanomoe_ops builds the variable-size topology. It is an optional compiled
+# extension (MEGABLOCKS_BUILD_EXTENSIONS=1), and one built against another
+# CUDA or torch fails to load with a plain ImportError.
 try:
     import nanomoe_ops
-except ModuleNotFoundError:
+except ImportError:
     nanomoe_ops = None
 
 
@@ -388,6 +390,11 @@ class MoEMLP(nn.Module):
         offsets_t = torch.empty(total_col_blocks + 1, dtype=torch.int32, device=dev)
         block_offsets_t = torch.empty(total_nnz, dtype=torch.int32, device=dev)
 
+        if nanomoe_ops is None:
+            raise RuntimeError(
+                "MoEMLP needs the nanomoe_ops extension; build it with "
+                "MEGABLOCKS_BUILD_EXTENSIONS=1 against the installed torch",
+            )
         nanomoe_ops.build_topology(
             padded_bins,
             self.expert_size_blocks,

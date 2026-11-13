@@ -50,7 +50,7 @@ def _reference(x, top_w, top_e, w_gate, w_up, w_down, widths):
     return out
 
 
-def _run(widths, hidden, top_k, num_tokens, seed=0):
+def _inputs(widths, hidden, top_k, num_tokens, seed=0, block_n=128):
     torch.manual_seed(seed)
     dev = torch.device('cuda')
     total = sum(widths)
@@ -63,7 +63,13 @@ def _run(widths, hidden, top_k, num_tokens, seed=0):
     top_w, top_e = torch.topk(F.softmax(logits, dim=1, dtype=torch.float), top_k, -1)
     top_w = top_w.to(torch.bfloat16)
 
-    plan = FusedMoEPlan(widths, hidden, dev)
+    plan = FusedMoEPlan(widths, hidden, dev, block_n=block_n)
+    return x, top_w, top_e, w_gate, w_up, w_down, plan
+
+
+def _run(widths, hidden, top_k, num_tokens, seed=0, block_n=128):
+    x, top_w, top_e, w_gate, w_up, w_down, plan = _inputs(
+        widths, hidden, top_k, num_tokens, seed, block_n)
     got = fused_moe_forward(x, top_w.flatten(), top_e.flatten().int(), plan,
                             top_k, w_gate, w_up, w_down)
     want = _reference(x, top_w, top_e, w_gate, w_up, w_down, widths)
@@ -174,3 +180,62 @@ def test_output_is_deterministic_despite_atomic_ordering():
         if ref is None:
             ref = rel
         assert rel == ref, f'nondeterministic output: {rel} vs {ref}'
+
+
+@pytest.mark.gpu
+@pytest.mark.world_size(1)
+@pytest.mark.parametrize(
+    'widths, block_n',
+    [
+        ([32, 128, 96] * 3, 32),    # narrower than the down projection's K tile
+        ([64, 128, 192] * 3, 64),
+        ([256, 512] * 4, 256),
+    ],
+)
+def test_other_width_blocks(widths, block_n):
+    # A 32-wide block used to contract 64 columns, reading the next expert's
+    # weights against unwritten activations: 8x error with no exception.
+    rel = _run(widths, 256, 2, 100, block_n=block_n)
+    assert rel < 5e-3, f'relative error {rel:.3e} too large for bf16'
+
+
+@pytest.mark.gpu
+@pytest.mark.world_size(1)
+def test_noncontiguous_inputs():
+    # Strided x and weights must give what the same data gives in fresh tensors.
+    top_k = 2
+    x, top_w, top_e, w_gate, w_up, w_down, plan = _inputs([128, 256] * 4, 256, top_k, 100)
+    ids = top_e.flatten().int()
+    want = fused_moe_forward(x, top_w.flatten(), ids, plan, top_k, w_gate, w_up, w_down)
+
+    def strided(t):
+        wide = torch.zeros(t.shape[0], 2 * t.shape[1], dtype=t.dtype, device=t.device)
+        wide[:, ::2] = t
+        return wide[:, ::2]
+
+    views = [strided(t) for t in (x, w_gate, w_up, w_down)]
+    assert not any(v.is_contiguous() for v in views)
+    got = fused_moe_forward(views[0], top_w.flatten(), ids, plan, top_k, *views[1:])
+    assert torch.equal(got, want)
+
+
+@pytest.mark.gpu
+@pytest.mark.world_size(1)
+@pytest.mark.parametrize('hidden', [96, 192, 320])
+def test_unsupported_hidden_raises(hidden):
+    # These sizes read past each x row or leave output columns unwritten.
+    x, top_w, top_e, w_gate, w_up, w_down, plan = _inputs([128, 256], hidden, 1, 4)
+    with pytest.raises(ValueError, match='hidden must be'):
+        fused_moe_forward(x, top_w.flatten(), top_e.flatten().int(), plan, 1,
+                          w_gate, w_up, w_down)
+
+
+@pytest.mark.gpu
+@pytest.mark.world_size(1)
+def test_int64_expert_ids_raise():
+    # topk returns int64 indices, and the counting kernel failed to compile on
+    # them with a Triton compiler dump instead of an error.
+    x, top_w, top_e, w_gate, w_up, w_down, plan = _inputs([128, 256], 256, 2, 4)
+    with pytest.raises(TypeError, match='int32'):
+        fused_moe_forward(x, top_w.flatten(), top_e.flatten(), plan, 2,
+                          w_gate, w_up, w_down)
