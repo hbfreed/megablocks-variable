@@ -56,25 +56,35 @@ For an editable development environment:
 ```console
 git clone https://github.com/hbfreed/megablocks-variable.git
 cd megablocks-variable
-UV_TORCH_BACKEND=cu126 uv sync --extra dev
+uv sync --extra dev
 ```
+
+The lock file pins PyTorch 2.12 with its CUDA 13.0 wheels, the stack the
+numbers above were measured on.
+
+The fused and grouped paths need only PyTorch. `megablocks.ops` and
+`megablocks.layers.relu_squared`, the older block-sparse path, also need
+[STK](https://github.com/stanford-futuredata/stk): install `megablocks[stk]`.
 
 The default Triton paths do not build CUDA extensions. Set
 `MEGABLOCKS_BUILD_EXTENSIONS=1` only for legacy consumers that still need
-`nanomoe_ops.indices_variable`.
+`nanomoe_ops`; that build needs PyTorch in the build environment (for uv,
+list `torch` under `[tool.uv.extra-build-dependencies]`).
 
 ### Optional CuTe training backend
 
 Install the CuTe extra:
 
 ```console
-UV_TORCH_BACKEND=cu126 uv sync --extra cute
+uv sync --extra cute
 ```
 
 The current CuTe implementation targets BF16 on Ampere (compute capability
 8.x) with hidden sizes divisible by 256. Select it explicitly:
 
 ```python
+from megablocks.backend.grouped_moe import grouped_moe
+
 output = grouped_moe(
     x,
     top_weights,
@@ -101,9 +111,9 @@ GPU operator tests are marked explicitly:
 pytest -m gpu tests/ops
 ```
 
-The Triton and CuTe training changes were validated with 226 single-GPU
-operator cases. The optional CuTe tests require its dependencies and Ampere
-hardware.
+The optional CuTe tests require its dependencies and Ampere hardware, and are
+skipped without them. A plain `pytest` runs only the few tests that need no
+GPU.
 
 ## Project history and attribution
 

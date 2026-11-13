@@ -12,7 +12,3 @@ def inclusive_cumsum(x: torch.Tensor, dim: int) -> torch.Tensor:
     for ``nanomoe_ops.build_topology``.
     """
     return torch.cumsum(x, dim, dtype=x.dtype)
-
-
-def exclusive_cumsum(x: torch.Tensor, dim: int) -> torch.Tensor:
-    return torch.cumsum(x, dim, dtype=x.dtype) - x

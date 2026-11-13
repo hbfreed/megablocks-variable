@@ -190,7 +190,6 @@ def _require_cute():
 
 
 @pytest.mark.gpu
-@pytest.mark.world_size(1)
 @pytest.mark.parametrize('recompute_activation', [True, False])
 @pytest.mark.parametrize('widths, hidden, top_k, num_tokens', _CASES)
 def test_matches_dense_autograd_reference(
@@ -205,7 +204,6 @@ def test_matches_dense_autograd_reference(
 
 
 @pytest.mark.gpu
-@pytest.mark.world_size(1)
 def test_zero_routing_weights():
     # A route can carry weight 0 (masked tokens, renormalized routers); its
     # weight gradient is still <y_row, dout>, which a recovery that divides
@@ -214,7 +212,6 @@ def test_zero_routing_weights():
 
 
 @pytest.mark.gpu
-@pytest.mark.world_size(1)
 @pytest.mark.parametrize(
     'widths, hidden, top_k, num_tokens, recompute_activation',
     [
@@ -241,7 +238,6 @@ def test_cute_backend_matches_dense_autograd_reference(
 
 
 @pytest.mark.gpu
-@pytest.mark.world_size(1)
 @pytest.mark.parametrize('down_proj_backend', ['triton', 'cute'])
 @pytest.mark.parametrize(
     'widths, hidden, top_k, num_tokens',
@@ -267,7 +263,6 @@ def test_nearest_token_rounding_matches_reference(
 
 
 @pytest.mark.gpu
-@pytest.mark.world_size(1)
 @pytest.mark.parametrize(
     'down_proj_backend, token_rounding',
     [('triton', 'ceil'), ('cute', 'ceil'), ('triton', 'nearest')],
@@ -294,7 +289,6 @@ def test_training_step_is_bitwise_reproducible(down_proj_backend, token_rounding
 
 
 @pytest.mark.gpu
-@pytest.mark.world_size(1)
 @pytest.mark.parametrize('down_proj_backend', ['triton', 'cute'])
 def test_unaligned_dout(down_proj_backend):
     # The backward gathers read the caller's dout directly, and a contiguous
@@ -315,7 +309,6 @@ def test_unaligned_dout(down_proj_backend):
 
 
 @pytest.mark.gpu
-@pytest.mark.world_size(1)
 @pytest.mark.parametrize(
     'widths, top_k, num_tokens',
     [
@@ -361,7 +354,6 @@ def test_routing_layout_is_stable(widths, top_k, num_tokens):
 
 
 @pytest.mark.gpu
-@pytest.mark.world_size(1)
 def test_forward_saves_no_hidden_wide_route_buffer():
     # With w_r folded into h, backward derives the routing-weight gradient
     # from the intermediate, so the (rows, hidden) down-projection output is
@@ -380,7 +372,6 @@ def test_forward_saves_no_hidden_wide_route_buffer():
 
 
 @pytest.mark.gpu
-@pytest.mark.world_size(1)
 def test_nearest_rounding_layout():
     # Exactly the expected routes are dropped (row -1); each expert's kept
     # routes fill its rows in descending-score order; an expert that rounded
@@ -423,7 +414,6 @@ def test_nearest_rounding_layout():
 
 
 @pytest.mark.gpu
-@pytest.mark.world_size(1)
 @pytest.mark.parametrize('token_rounding', ['ceil', 'nearest'])
 def test_route_stats(token_rounding):
     # The fractions gpt_model.MoEMLP reports, left on the device. Asking for
@@ -465,7 +455,6 @@ def test_route_stats(token_rounding):
 
 
 @pytest.mark.gpu
-@pytest.mark.world_size(1)
 def test_cute_short_k_loop():
     # One K tile with three pipeline stages: the prologue must still commit one
     # cp.async group per stage, or its wait passes with data in flight. A 32-wide
@@ -493,7 +482,6 @@ def test_cute_short_k_loop():
 
 
 @pytest.mark.gpu
-@pytest.mark.world_size(1)
 def test_cute_one_row_view():
     # A one-row view is contiguous but keeps its parent's stride, which compiling
     # a CuTe kernel used to reject. It must match the same data in a fresh tensor.
@@ -524,7 +512,6 @@ def test_cute_one_row_view():
 
 
 @pytest.mark.gpu
-@pytest.mark.world_size(1)
 @pytest.mark.parametrize('hidden', [64, 192, 384])
 def test_unsupported_hidden_raises(hidden):
     # These sizes would leave part of the output or weight gradients unwritten.
@@ -540,7 +527,6 @@ def test_unsupported_hidden_raises(hidden):
 
 
 @pytest.mark.gpu
-@pytest.mark.world_size(1)
 @pytest.mark.parametrize('down_proj_backend', ['triton', 'cute'])
 def test_runs_on_current_stream(down_proj_backend):
     # Every kernel must launch on torch's current stream. CuTe used to launch on
@@ -559,7 +545,6 @@ def test_runs_on_current_stream(down_proj_backend):
 
 
 @pytest.mark.gpu
-@pytest.mark.world_size(1)
 @pytest.mark.parametrize('down_proj_backend', ['triton', 'cute'])
 @pytest.mark.parametrize(
     'widths, block_n',
@@ -574,7 +559,6 @@ def test_width_block_above_128(widths, block_n, down_proj_backend):
 
 
 @pytest.mark.gpu
-@pytest.mark.world_size(1)
 @pytest.mark.parametrize('down_proj_backend', ['triton', 'cute'])
 def test_noncontiguous_inputs(down_proj_backend):
     # Strided x and weights must give what the same data gives in fresh tensors.
@@ -606,7 +590,6 @@ def test_noncontiguous_inputs(down_proj_backend):
 
 
 @pytest.mark.gpu
-@pytest.mark.world_size(1)
 @pytest.mark.parametrize(
     'widths, hidden, top_k, num_tokens',
     [
@@ -630,7 +613,6 @@ def test_nearest_keeps_experts_under_half_a_tile(widths, hidden, top_k, num_toke
 
 
 @pytest.mark.gpu
-@pytest.mark.world_size(1)
 @pytest.mark.parametrize('widths, block_n', [([32, 128], 32), ([64, 128, 192], 64)])
 def test_narrow_width_block_raises(widths, block_n):
     # The row-tile and weight-gradient kernels tile the width axis in 128s. Under
@@ -643,7 +625,6 @@ def test_narrow_width_block_raises(widths, block_n):
 
 
 @pytest.mark.gpu
-@pytest.mark.world_size(1)
 def test_int64_expert_ids_raise():
     # topk returns int64 indices, and the routing kernels failed to compile on
     # them with a Triton compiler dump instead of an error.

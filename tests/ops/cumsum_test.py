@@ -28,15 +28,6 @@ CUMSUM_TESTS = (
 
 @pytest.mark.gpu
 @pytest.mark.parametrize(('n', 'm'), CUMSUM_TESTS)
-def test_exclusive_cumsum(n: int, m: int):
-    x = torch.randint(0, 2, (n, m)).long().cuda()
-    out = ops.exclusive_cumsum(x, 1) * x
-    expected_out = (torch.cumsum(x, dim=1) - 1) * x
-    assert torch.all(torch.eq(out, expected_out))
-
-
-@pytest.mark.gpu
-@pytest.mark.parametrize(('n', 'm'), CUMSUM_TESTS)
 def test_inclusive_cumsum(n: int, m: int):
     x = torch.randint(0, 2, (n, m)).long().cuda()
     out = ops.inclusive_cumsum(x, 1)
