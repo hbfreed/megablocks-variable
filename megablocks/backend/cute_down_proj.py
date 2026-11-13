@@ -45,6 +45,7 @@ and never reads routing metadata back to the host.
 
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import dataclass
 
@@ -61,6 +62,19 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
         "The CuTe grouped-GEMM experiment needs nvidia-cutlass-dsl>=4.6 "
         "and apache-tvm-ffi. The normal Triton backend does not need them.",
     ) from exc
+
+
+@functools.cache
+def _is_ampere(device):
+    return torch.cuda.get_device_capability(device)[0] == 8
+
+
+def supports(x, w_gate, w_up, w_down):
+    """Whether these kernels take grouped_moe's operands: BF16 x and weights on
+    a compute capability 8.x GPU, with hidden a multiple of 256."""
+    return (x.is_cuda and x.shape[1] % 256 == 0
+            and all(t.dtype == torch.bfloat16 for t in (x, w_gate, w_up, w_down))
+            and _is_ampere(x.device))
 
 
 class _AmpereRaggedDown:

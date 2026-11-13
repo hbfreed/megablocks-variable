@@ -778,24 +778,19 @@ def _route(expert_ids, top_weights, plan, top_k, m_tiles, row_bound,
 
 
 @functools.cache
-def _cute_installed():
+def _cute():
+    """The CuTe kernel module, or None when the cute extra is not installed."""
     try:
-        import megablocks.backend.cute_down_proj  # noqa: F401
+        from megablocks.backend import cute_down_proj
     except ImportError:
-        return False
-    return True
-
-
-@functools.cache
-def _is_ampere(device):
-    return torch.cuda.get_device_capability(device)[0] == 8
+        return None
+    return cute_down_proj
 
 
 def _resolve_backend(x, w_gate, w_up, w_down):
-    """Picks 'cute' where its kernels apply and are installed, else 'triton'."""
-    if (x.is_cuda and x.shape[1] % 256 == 0
-            and all(t.dtype == torch.bfloat16 for t in (x, w_gate, w_up, w_down))
-            and _is_ampere(x.device) and _cute_installed()):
+    """Picks 'cute' where its kernels are installed and apply, else 'triton'."""
+    cute = _cute()
+    if cute is not None and cute.supports(x, w_gate, w_up, w_down):
         return 'cute'
     return 'triton'
 
