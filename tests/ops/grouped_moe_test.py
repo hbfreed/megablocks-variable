@@ -687,7 +687,7 @@ def test_custom_op_registration(token_rounding, recompute_activation):
         (x, top_w.flatten(), top_e.flatten().int(), w_gate, w_up, w_down,
          scores.flatten() if token_rounding == 'nearest' else None,
          plan.op_key, top_k, 'triton', recompute_activation, token_rounding,
-         True),
+         True, -1),
         test_utils=('test_schema', 'test_autograd_registration',
                     'test_faketensor'),
     )
@@ -774,3 +774,162 @@ def test_cuda_graph_replay(down_proj_backend):
         assert torch.equal(got[0], want_out)
         for name, g, w in zip(_GRAD_NAMES, got[1], want_grads):
             assert torch.equal(g, w), f'{name} differs bitwise (seed {seed})'
+
+
+# Gradient-accumulation fusion (register_weight_grads / weight_grad_key).
+_ACCUM_CASE = ([128, 256, 384, 512] * 16, 1024, 8, 1024)
+_WEIGHT_NAMES = ('dwg', 'dwu', 'dwd')
+
+
+def _micro_batches(n, seed=0, weight_dtype=torch.bfloat16):
+    """n micro-batches of fresh tokens, routing and dout over one set of weights."""
+    widths, hidden, top_k, num_tokens = _ACCUM_CASE
+    batches = [_inputs(widths, hidden, top_k, num_tokens, seed=seed + i)
+               for i in range(n)]
+    weights = [w.detach().to(weight_dtype).requires_grad_()
+               for w in batches[0][3:6]]
+    plan = batches[0][7]
+    return [(b[0], b[1], b[2], b[6]) for b in batches], weights, plan
+
+
+def _accumulate(batches, weights, plan, backend, key=None, fn=None):
+    """Forward + backward over each micro-batch, without clearing the weight
+    grads in between. Returns per-micro-batch (out, dx, dtw) and weight-grad
+    snapshots."""
+    top_k = _ACCUM_CASE[2]
+    fn = fn or (lambda x, top_w, top_e, wg, wu, wd: grouped_moe(
+        x, top_w.flatten(), top_e.flatten().int(), plan, top_k, wg, wu, wd,
+        backend, weight_grad_key=key))
+    acts, snaps = [], []
+    for x, top_w, top_e, dout in batches:
+        out = fn(x, top_w, top_e,
+                 *(w.to(torch.bfloat16) for w in weights))
+        out.backward(dout)
+        acts.append((out.detach(), x.grad, top_w.grad))
+        x.grad = top_w.grad = None
+        snaps.append([None if w.grad is None else w.grad.clone()
+                      for w in weights])
+    return acts, snaps
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize('down_proj_backend', ['triton', 'cute'])
+def test_weight_grad_accumulation_matches_autograd(down_proj_backend):
+    # Three micro-batches into the weights' .grad: the first writes it (it is
+    # None) bitwise as autograd would, the later ones add in fp32 and round
+    # once, so they differ from autograd's separate bf16 add by bf16 rounding
+    # only. Every other output and gradient is bitwise unchanged.
+    if down_proj_backend == 'cute':
+        _require_cute()
+    batches, weights, plan = _micro_batches(3)
+    want_acts, want = _accumulate(batches, weights, plan, down_proj_backend)
+    for w in weights:
+        w.grad = None
+    key = grouped_moe_module.register_weight_grads(*weights)
+    got_acts, got = _accumulate(batches, weights, plan, down_proj_backend, key)
+
+    for (go, gdx, gdtw), (wo, wdx, wdtw) in zip(got_acts, want_acts):
+        assert torch.equal(go, wo) and torch.equal(gdx, wdx)
+        assert torch.equal(gdtw, wdtw)
+    for name, g, w in zip(_WEIGHT_NAMES, got[0], want[0]):
+        assert torch.equal(g, w), f'{name} differs bitwise after one micro-batch'
+    for step in (1, 2):
+        for name, g, w in zip(_WEIGHT_NAMES, got[step], want[step]):
+            err = _rel(g, w)
+            assert err < 4e-3, f'{name} after {step + 1} micro-batches: {err:.3e}'
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize('down_proj_backend', ['triton', 'cute'])
+def test_weight_grad_accumulation_in_place(down_proj_backend):
+    # A zeroed .grad (zero_grad(set_to_none=False)) is accumulated into in
+    # place, and acc + 0 rounds to the unfused gradient bitwise.
+    if down_proj_backend == 'cute':
+        _require_cute()
+    batches, weights, plan = _micro_batches(1)
+    _, want = _accumulate(batches, weights, plan, down_proj_backend)
+    for w in weights:
+        w.grad = torch.zeros_like(w)
+    ptrs = [w.grad.data_ptr() for w in weights]
+    key = grouped_moe_module.register_weight_grads(*weights)
+    _, got = _accumulate(batches, weights, plan, down_proj_backend, key)
+    assert [w.grad.data_ptr() for w in weights] == ptrs
+    for name, g, w in zip(_WEIGHT_NAMES, got[0], want[0]):
+        assert torch.equal(g, w), f'{name} differs bitwise'
+
+
+@pytest.mark.gpu
+def test_weight_grad_accumulation_fp32_weights():
+    # fp32 leaves cast to bf16 for the op cannot take the bf16 kernels' output
+    # in place, so it is added the way AccumulateGrad adds it: bitwise as before.
+    batches, weights, plan = _micro_batches(2, weight_dtype=torch.float32)
+    _, want = _accumulate(batches, weights, plan, 'triton')
+    for w in weights:
+        w.grad = None
+    key = grouped_moe_module.register_weight_grads(*weights)
+    _, got = _accumulate(batches, weights, plan, 'triton', key)
+    for step in range(2):
+        for name, g, w in zip(_WEIGHT_NAMES, got[step], want[step]):
+            assert g.dtype == torch.float32
+            assert torch.equal(g, w), f'{name} differs bitwise'
+
+
+@pytest.mark.gpu
+def test_weight_grad_accumulation_skips_frozen_weight():
+    batches, weights, plan = _micro_batches(1)
+    _, want = _accumulate(batches, weights, plan, 'triton')
+    for w in weights:
+        w.grad = None
+    weights[2].requires_grad_(False)
+    key = grouped_moe_module.register_weight_grads(*weights)
+    _, got = _accumulate(batches, weights, plan, 'triton', key)
+    assert got[0][2] is None
+    for name, g, w in zip(_WEIGHT_NAMES[:2], got[0][:2], want[0][:2]):
+        assert torch.equal(g, w), f'{name} differs bitwise'
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize('down_proj_backend', ['triton', 'cute'])
+def test_weight_grad_accumulation_compiled(down_proj_backend):
+    # torch.compile(fullgraph=True) traces the fused path without a graph break
+    # and accumulates exactly what eager does.
+    if down_proj_backend == 'cute':
+        _require_cute()
+    top_k = _ACCUM_CASE[2]
+    batches, weights, plan = _micro_batches(2)
+    key = grouped_moe_module.register_weight_grads(*weights)
+
+    def layer(x, top_w, top_e, wg, wu, wd):
+        out = grouped_moe(x * 2, top_w.flatten(), top_e.flatten().int(), plan,
+                          top_k, wg, wu, wd, down_proj_backend,
+                          weight_grad_key=key)
+        return out + x
+
+    compiled = torch.compile(layer, fullgraph=True, dynamic=False)
+    results = []
+    for fn in (layer, compiled):
+        results.append(_accumulate(batches, weights, plan, down_proj_backend,
+                                   fn=fn))
+        for w in weights:
+            w.grad = None
+    (want_acts, want), (got_acts, got) = results
+    for g, w in zip(got_acts, want_acts):
+        assert all(torch.equal(a, b) for a, b in zip(g, w))
+    for step in range(2):
+        for name, g, w in zip(_WEIGHT_NAMES, got[step], want[step]):
+            assert torch.equal(g, w), f'{name} differs bitwise (step {step})'
+
+
+@pytest.mark.gpu
+def test_weight_grad_key_custom_op_registration():
+    top_k = 4
+    x, top_w, top_e, w_gate, w_up, w_down, _, plan, _ = _inputs(
+        [128, 256, 384, 512] * 4, 256, top_k, 33)
+    key = grouped_moe_module.register_weight_grads(w_gate, w_up, w_down)
+    torch.library.opcheck(
+        grouped_moe_module._grouped_moe_fwd,
+        (x, top_w.flatten(), top_e.flatten().int(), w_gate, w_up, w_down,
+         None, plan.op_key, top_k, 'triton', True, 'ceil', False, key),
+        test_utils=('test_schema', 'test_autograd_registration',
+                    'test_faketensor'),
+    )
