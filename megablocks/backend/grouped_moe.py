@@ -62,6 +62,8 @@ experts get exact-zero grads rather than stale memory.
 """
 
 import functools
+import itertools
+import weakref
 from typing import Optional
 
 import torch
@@ -496,7 +498,8 @@ def _route_dw(
 # That count is a whole number of K tiles inside the expert's padded rows, so a
 # lane needs a mask only where it gathers a token. The operand loads in MMA
 # orientation: a masked load followed by tl.trans stays in registers on blocking
-# LDGs instead of using cp.async.
+# LDGs instead of using cp.async. ACCUMULATE adds the fp32 tile to the dw already
+# in memory and rounds once (gradient accumulation into an existing .grad).
 @triton.jit
 def _wgrad_rows(
     a_rows,
@@ -512,6 +515,7 @@ def _wgrad_rows(
     BLOCK_W: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    ACCUMULATE: tl.constexpr,
 ):
     hb = tl.program_id(0)
     wb = tl.program_id(1)
@@ -533,13 +537,16 @@ def _wgrad_rows(
                     mask=(tok >= 0)[:, None], other=0.0)
         acc += tl.dot(a, b)
 
-    tl.store(dw + gcol[:, None] * HIDDEN + hcol[None, :],
-             acc.to(dw.dtype.element_ty))
+    dw_ptrs = dw + gcol[:, None] * HIDDEN + hcol[None, :]
+    if ACCUMULATE:
+        acc += tl.load(dw_ptrs).to(tl.float32)
+    tl.store(dw_ptrs, acc.to(dw.dtype.element_ty))
 
 
 # dW[h, c] = sum over rows of x[token(row), h] * d[row, c] for d in {dg, du}.
 # Padding rows gather x as zero, so they contribute exact zeros without any
-# extra masking of d. Loop bound and load orientation as in _wgrad_rows.
+# extra masking of d. Loop bound, load orientation and ACCUMULATE as in
+# _wgrad_rows.
 @triton.jit
 def _wgrad_gather(
     x,
@@ -556,6 +563,7 @@ def _wgrad_gather(
     BLOCK_W: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    ACCUMULATE: tl.constexpr,
 ):
     hb = tl.program_id(0)
     wb = tl.program_id(1)
@@ -577,8 +585,10 @@ def _wgrad_gather(
         b = tl.load(d_rows + rows[:, None] * MAX_W + lcol[None, :])
         acc += tl.dot(a, b)
 
-    tl.store(dw + hcol[:, None] * TOTAL_W + gcol[None, :],
-             acc.to(dw.dtype.element_ty))
+    dw_ptrs = dw + hcol[:, None] * TOTAL_W + gcol[None, :]
+    if ACCUMULATE:
+        acc += tl.load(dw_ptrs).to(tl.float32)
+    tl.store(dw_ptrs, acc.to(dw.dtype.element_ty))
 
 
 # Single-launch form of the two input-gradient GEMMs. It retains one fp32
@@ -1004,10 +1014,98 @@ def _forward_impl(x, top_weights, expert_ids, w_gate, w_up, w_down,
             g, u, row_w, empty if saved_h is None else saved_h)
 
 
+# Gradient-accumulation fusion. With gradient accumulation, autograd computes
+# each micro-batch's dW into a fresh buffer and then adds it to .grad in a
+# separate pass. At nanochat's 1.27B shape (12 layers of 128 x 512 experts,
+# 4 micro-batches of 8192 tokens) those adds took 25.9 ms of a 649 ms step on a
+# 3090. register_weight_grads names the three leaf weights whose .grad the
+# backward then writes directly: the weight-gradient kernels add their fp32
+# tile to the existing .grad and round once (their ACCUMULATE flag), or, when
+# .grad is None, as after zero_grad(set_to_none=True), write a fresh one, which
+# is what AccumulateGrad does. Autograd then receives None for those weights.
+#
+# The ops take the registry's int key, as they take a plan's, because a module's
+# parameters are not op inputs: under torch.compile the backward op sees saved
+# activations, not the Parameter objects whose .grad changes. So the write to
+# .grad is a side effect the op schema does not declare. It is safe because
+# nothing else in the backward graph reads those .grad tensors, and the op's
+# real outputs (dx, d top_weights) keep it alive and in place. The write/add
+# choice is made when the backward runs, so it is right for every micro-batch
+# and under activation checkpointing; a CUDA graph would freeze it at capture.
+_WEIGHT_GRAD_PARAMS: dict[int, tuple] = {}
+_WEIGHT_GRAD_KEYS = itertools.count()
+
+
+def register_weight_grads(w_gate, w_up, w_down):
+    """Returns a key for grouped_moe's ``weight_grad_key``.
+
+    Call it once per layer, outside any compiled region, with the leaf tensors
+    (usually ``nn.Parameter``s) whose ``.grad`` should receive the gate, up and
+    down weight gradients. The registry holds weak references.
+    """
+    params = (w_gate, w_up, w_down)
+    for p in params:
+        if not isinstance(p, torch.Tensor) or not p.is_leaf:
+            raise TypeError('register_weight_grads takes leaf tensors')
+    key = next(_WEIGHT_GRAD_KEYS)
+    _WEIGHT_GRAD_PARAMS[key] = tuple(weakref.ref(p) for p in params)
+    return key
+
+
+def _weight_grad_params(key):
+    if key < 0:
+        return None
+    params = tuple(r() for r in _WEIGHT_GRAD_PARAMS[key])
+    if any(p is None for p in params):
+        raise RuntimeError(
+            f'grouped_moe weight_grad_key {key}: a registered weight was freed')
+    return params
+
+
+class _WeightGrad:
+    """Destination of one weight gradient in _backward_impl.
+
+    Without a registered parameter, ``out`` is a fresh tensor that ``finish``
+    returns for autograd. With one, the kernel writes straight into its .grad
+    when the dtype, shape and layout allow it: it accumulates into an existing
+    .grad, or writes a fresh one that ``finish`` installs. Otherwise (an fp32
+    master weight, a strided .grad) it writes a fresh tensor that ``finish``
+    adds the way AccumulateGrad would. ``finish`` then returns an empty
+    placeholder.
+    """
+
+    def __init__(self, param, w):
+        self.param = param
+        self.needed = param is None or param.requires_grad
+        self.accumulate = False
+        grad = None if param is None else param.grad
+        direct = (
+            param is not None and param.dtype == w.dtype
+            and param.shape == w.shape and param.is_contiguous()
+            and (grad is None or grad.is_contiguous())
+        )
+        if direct and grad is not None:
+            self.out, self.accumulate = grad, True
+        elif self.needed:
+            self.out = torch.empty_like(w, memory_format=torch.contiguous_format)
+
+    def finish(self):
+        p = self.param
+        if p is None:
+            return self.out
+        if not self.needed or self.accumulate:
+            pass
+        elif p.grad is None:
+            p.grad = self.out.to(p.dtype).view(p.shape)
+        else:
+            p.grad.add_(self.out.view(p.shape))
+        return p.new_empty(0)
+
+
 def _backward_impl(dout, x, top_weights, w_gate, w_up, w_down,
                    route_tokens, route_rows, tile_expert, counts, row_start,
                    g, u, row_w, saved_h, plan, top_k, down_proj_backend,
-                   recompute_activation):
+                   recompute_activation, weight_grad_params=None):
     x, top_weights = x.contiguous(), top_weights.contiguous()
     w_gate, w_up, w_down = (w_gate.contiguous(), w_up.contiguous(),
                             w_down.contiguous())
@@ -1093,26 +1191,30 @@ def _backward_impl(dout, x, top_weights, w_gate, w_up, w_down,
         num_warps=4,
     )
 
+    p_gate, p_up, p_down = weight_grad_params or (None, None, None)
     ww, wh, wk, wwar, wst = _CFG['wgrad_down']
-    dwd = torch.empty_like(w_down)
-    if down_proj_backend == 'cute':
+    dwd = _WeightGrad(p_down, w_down)
+    if not dwd.needed:
+        pass
+    elif down_proj_backend == 'cute':
         from megablocks.backend.cute_down_proj import cute_wgrad_rows
 
         cute_wgrad_rows(
             h,
             dout,
             route_tokens,
-            dwd,
+            dwd.out,
             _wb_expert_table(plan, 128),
             plan.expert_col_off,
             counts,
             row_start,
+            accumulate=dwd.accumulate,
         )
     else:
         _wgrad_rows[(hidden // wh, plan.total_width // ww)](
             h,
             dout,
-            dwd,
+            dwd.out,
             route_tokens,
             _wb_expert_table(plan, ww),
             plan.expert_col_off,
@@ -1123,14 +1225,20 @@ def _backward_impl(dout, x, top_weights, w_gate, w_up, w_down,
             BLOCK_W=ww,
             BLOCK_H=wh,
             BLOCK_K=wk,
+            ACCUMULATE=dwd.accumulate,
             num_warps=wwar,
             num_stages=wst,
         )
+    dwd = dwd.finish()
     del h
 
-    dwg = torch.empty_like(w_gate)
-    dwu = torch.empty_like(w_up)
-    if down_proj_backend == 'cute':
+    dwg = _WeightGrad(p_gate, w_gate)
+    dwu = _WeightGrad(p_up, w_up)
+    # The fused CuTe pair writes or adds both gradients in one launch, so it needs
+    # both of them, in the same mode, as bf16; anything else takes the Triton loop.
+    if (down_proj_backend == 'cute' and dwg.needed and dwu.needed
+            and dwg.accumulate == dwu.accumulate
+            and dwg.out.dtype == dwu.out.dtype == torch.bfloat16):
         from megablocks.backend.cute_down_proj import cute_wgrad_gather_pair
 
         cute_wgrad_gather_pair(
@@ -1138,21 +1246,24 @@ def _backward_impl(dout, x, top_weights, w_gate, w_up, w_down,
             du,
             x,
             route_tokens,
-            dwg,
-            dwu,
+            dwg.out,
+            dwu.out,
             _wb_expert_table(plan, 128),
             plan.expert_col_off,
             counts,
             row_start,
+            accumulate=dwg.accumulate,
         )
     else:
         ww, wh, wk, wwar, wst = _CFG['wgrad_gateup']
         wb_expert = _wb_expert_table(plan, ww)
         for d_rows, dw in ((dg, dwg), (du, dwu)):
+            if not dw.needed:
+                continue
             _wgrad_gather[(hidden // wh, plan.total_width // ww)](
                 x,
                 d_rows,
-                dw,
+                dw.out,
                 route_tokens,
                 wb_expert,
                 plan.expert_col_off,
@@ -1164,9 +1275,11 @@ def _backward_impl(dout, x, top_weights, w_gate, w_up, w_down,
                 BLOCK_W=ww,
                 BLOCK_H=wh,
                 BLOCK_K=wk,
+                ACCUMULATE=dw.accumulate,
                 num_warps=wwar,
                 num_stages=wst,
             )
+    dwg, dwu = dwg.finish(), dwu.finish()
 
     dx_rows = torch.empty((row_bound, hidden), dtype=x.dtype, device=dev)
     if down_proj_backend == 'cute':
@@ -1234,6 +1347,7 @@ def _grouped_moe_fwd(
     w_up: _Tensor, w_down: _Tensor, route_scores: Optional[_Tensor],
     plan_key: int, top_k: int, down_proj_backend: str,
     recompute_activation: bool, token_rounding: str, return_route_stats: bool,
+    weight_grad_key: int,
 ) -> tuple[_Tensor, _Tensor, _Tensor, _Tensor, _Tensor, _Tensor, _Tensor,
            _Tensor, _Tensor, _Tensor, _Tensor]:
     return _forward_impl(x, top_weights, expert_ids, w_gate, w_up, w_down,
@@ -1245,7 +1359,7 @@ def _grouped_moe_fwd(
 @_grouped_moe_fwd.register_fake
 def _(x, top_weights, expert_ids, w_gate, w_up, w_down, route_scores,
       plan_key, top_k, down_proj_backend, recompute_activation,
-      token_rounding, return_route_stats):
+      token_rounding, return_route_stats, weight_grad_key):
     plan = plan_by_key(plan_key)
     num_tokens, hidden = x.shape
     m_tiles, row_bound = plan.bounds(num_tokens, top_k, _ROW_BLOCK)
@@ -1270,17 +1384,21 @@ def _grouped_moe_bwd(
     route_rows: _Tensor, tile_expert: _Tensor, counts: _Tensor,
     row_start: _Tensor, g: _Tensor, u: _Tensor, row_w: _Tensor,
     saved_h: _Tensor, plan_key: int, top_k: int, down_proj_backend: str,
-    recompute_activation: bool,
+    recompute_activation: bool, weight_grad_key: int,
 ) -> tuple[_Tensor, _Tensor, _Tensor, _Tensor, _Tensor]:
     return _backward_impl(dout, x, top_weights, w_gate, w_up, w_down,
                           route_tokens, route_rows, tile_expert, counts,
                           row_start, g, u, row_w, saved_h,
                           plan_by_key(plan_key), top_k, down_proj_backend,
-                          recompute_activation)
+                          recompute_activation,
+                          _weight_grad_params(weight_grad_key))
 
 
 @_grouped_moe_bwd.register_fake
-def _(dout, x, top_weights, w_gate, w_up, w_down, *_):
+def _(dout, x, top_weights, w_gate, w_up, w_down, *args):
+    if args[-1] >= 0:  # weight_grad_key: the weight gradients went to .grad
+        return (torch.empty_like(x), torch.empty_like(top_weights),
+                w_gate.new_empty(0), w_up.new_empty(0), w_down.new_empty(0))
     return (torch.empty_like(x), torch.empty_like(top_weights),
             torch.empty_like(w_gate), torch.empty_like(w_up),
             torch.empty_like(w_down))
@@ -1288,7 +1406,7 @@ def _(dout, x, top_weights, w_gate, w_up, w_down, *_):
 
 def _setup_context(ctx, inputs, output):
     (x, top_weights, _, w_gate, w_up, w_down, _, plan_key, top_k,
-     down_proj_backend, recompute_activation, _, _) = inputs
+     down_proj_backend, recompute_activation, _, _, weight_grad_key) = inputs
     (_, stats, route_tokens, route_rows, tile_expert, counts, row_start,
      g, u, row_w, saved_h) = output
     ctx.mark_non_differentiable(stats, g, u, row_w, saved_h)
@@ -1299,13 +1417,16 @@ def _setup_context(ctx, inputs, output):
     ctx.save_for_backward(x, top_weights, w_gate, w_up, w_down,
                           route_tokens, route_rows, tile_expert, counts,
                           row_start, g, u, row_w, saved_h)
-    ctx.args = (plan_key, top_k, down_proj_backend, recompute_activation)
+    ctx.args = (plan_key, top_k, down_proj_backend, recompute_activation,
+                weight_grad_key)
 
 
 def _backward(ctx, dout, *_):
     dx, dtw, dwg, dwu, dwd = _grouped_moe_bwd(dout, *ctx.saved_tensors,
                                               *ctx.args)
-    return (dx, dtw, None, dwg, dwu, dwd) + (None,) * 7
+    if ctx.args[-1] >= 0:  # the backward wrote them to the weights' .grad
+        dwg = dwu = dwd = None
+    return (dx, dtw, None, dwg, dwu, dwd) + (None,) * 8
 
 
 _grouped_moe_fwd.register_autograd(_backward, setup_context=_setup_context)
@@ -1325,6 +1446,7 @@ def grouped_moe(
     token_rounding='ceil',
     route_scores=None,
     return_route_stats=False,
+    weight_grad_key=None,
 ):
     """Differentiable gated MoE over packed variable-width experts.
 
@@ -1358,6 +1480,13 @@ def grouped_moe(
     maps ``'dropped_route_fraction'`` and ``'padding_route_fraction'`` --
     gpt_model.MoEMLP's names -- to 0-dim float32 tensors left on the device,
     so logging them does not synchronize.
+
+    ``weight_grad_key``, from ``register_weight_grads(w_gate, w_up, w_down)``,
+    fuses gradient accumulation: the backward adds the three weight gradients
+    to the registered leaf weights' ``.grad`` (or creates it, when it is None)
+    inside the weight-gradient kernels, and autograd receives None for them.
+    The weights passed here must then be those leaves or casts of them. Hooks
+    registered on those leaves' gradients do not run.
     """
     backend = _check_args(x, expert_ids, w_gate, w_up, w_down, plan, top_k,
                           down_proj_backend, recompute_activation,
@@ -1365,7 +1494,7 @@ def grouped_moe(
     out, stats, *_ = _grouped_moe_fwd(
         x, top_weights, expert_ids, w_gate, w_up, w_down, route_scores,
         plan.op_key, top_k, backend, recompute_activation, token_rounding,
-        return_route_stats)
+        return_route_stats, -1 if weight_grad_key is None else weight_grad_key)
     if not return_route_stats:
         return out
     return out, {

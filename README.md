@@ -105,6 +105,23 @@ output = grouped_moe(
 for the measured layer shape. Keep the default `True` when activation memory
 is more valuable than the roughly 0.31 ms backward improvement.
 
+With gradient accumulation, autograd writes each micro-batch's weight
+gradients to fresh buffers and then adds them to `.grad` in a separate pass.
+Registering the weights once moves that add into the weight-gradient kernels,
+which accumulate in fp32 and round once:
+
+```python
+from megablocks.backend.grouped_moe import register_weight_grads
+
+key = register_weight_grads(w_gate, w_up, w_down)  # once, outside torch.compile
+output = grouped_moe(x, top_weights, expert_ids, plan, top_k,
+                     w_gate, w_up, w_down, weight_grad_key=key)
+```
+
+The first backward after `zero_grad(set_to_none=True)` writes `.grad`, as
+autograd would, and later ones add to it. Autograd then receives no gradient
+for those weights, so gradient hooks on them do not run.
+
 ## Tests
 
 GPU operator tests are marked explicitly:

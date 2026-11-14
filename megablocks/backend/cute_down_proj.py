@@ -88,9 +88,13 @@ class _AmpereRaggedDown:
         num_stages=3,
         atom_layout_mnk=(2, 4, 1),
         weight_mode="down",
+        accumulate=False,
     ):
         if weight_mode not in ("down", "dx_fused", "wgrad"):
             raise ValueError(f"unsupported ragged GEMM mode: {weight_mode!r}")
+        # Add the fp32 tile to the output already in memory and round once
+        # (gradient accumulation into an existing .grad). See _add_existing.
+        self.accumulate = accumulate
         self.cta_tiler = cta_tiler
         self.num_stages = num_stages
         self.atom_layout_mnk = atom_layout_mnk
@@ -457,6 +461,10 @@ class _AmpereRaggedDown:
                     tidx,
                 )
 
+            if cutlass.const_expr(self.accumulate):
+                self._add_existing(
+                    tiled_copy_C, tCgC_epilogue, tCsC_epilogue, tCsC, tCrC,
+                )
             tCrD = cute.make_fragment_like(tCrC, y.element_type)
             tCrD[None] = tCrC.load().to(y.element_type)
             cute.autovec_copy(tCrD, tCsC)
@@ -466,6 +474,22 @@ class _AmpereRaggedDown:
             cute.autovec_copy(tCsC_epilogue, tCrC_epilogue)
             cute.copy(tiled_copy_C, tCrC_epilogue, tCgC_epilogue)
         return
+
+    @cute.jit
+    def _add_existing(self, tiled_copy_C, tCgC_epilogue, tCsC_epilogue, tCsC,
+                      tCrC):
+        # tCrC += the output tile already in memory, in fp32, so the epilogue
+        # rounds the sum once. The tile comes in through the store's own
+        # coalesced copy and shared-memory staging buffer, then each thread
+        # reads back its accumulator's elements. A thread then overwrites only
+        # the shared elements it read, so the epilogue needs no extra barrier.
+        tCrE_epilogue = cute.make_fragment_like(tCsC_epilogue)
+        cute.copy(tiled_copy_C, tCgC_epilogue, tCrE_epilogue)
+        cute.autovec_copy(tCrE_epilogue, tCsC_epilogue)
+        cute.arch.sync_threads()
+        tCrE = cute.make_fragment_like(tCrC, tCsC.element_type)
+        cute.autovec_copy(tCsC, tCrE)
+        tCrC.store(tCrC.load() + tCrE.load().to(cutlass.Float32))
 
     @cute.jit
     def _accumulate_stream(
@@ -2257,8 +2281,13 @@ def cute_wgrad_rows(
     expert_col_off: torch.Tensor,
     counts: torch.Tensor,
     expert_row_start: torch.Tensor,
+    accumulate: bool = False,
 ) -> None:
-    """Compute packed ``a_rows.T @ dout[route_tokens]`` expert weight gradients."""
+    """Compute packed ``a_rows.T @ dout[route_tokens]`` expert weight gradients.
+
+    ``accumulate=True`` adds them to ``out`` in fp32 and rounds once, instead
+    of overwriting it.
+    """
     tensors = (
         a_rows,
         dout,
@@ -2300,6 +2329,7 @@ def cute_wgrad_rows(
         a_rows.shape[1],
         dout.shape[1],
         tuple(out.shape),
+        accumulate,
     )
     compiled = _WGRAD_CACHE.get(signature)
     if compiled is None:
@@ -2323,6 +2353,7 @@ def cute_wgrad_rows(
             num_stages=2,
             atom_layout_mnk=(2, 4, 1),
             weight_mode="wgrad",
+            accumulate=accumulate,
         )
         fn = cute.compile(op, *args, k_tile, _ENV_STREAM, options="--enable-tvm-ffi")
         compiled = _CompiledKernel(fn, signature)
