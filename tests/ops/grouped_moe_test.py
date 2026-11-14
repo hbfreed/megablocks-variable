@@ -513,6 +513,66 @@ def test_cute_one_row_view():
 
 
 @pytest.mark.gpu
+def test_cute_wgrad_pair_accumulate():
+    # The accumulate option, for gradient-accumulation fusion, adds the
+    # outputs' contents to the fp32 accumulators and rounds once. grouped_moe
+    # does not use it yet, so this drives the kernel directly. Expert 2 gets no
+    # routes and expert 3 a few, short of one K tile.
+    _require_cute()
+    from megablocks.backend.cute_down_proj import cute_wgrad_gather_pair
+
+    widths, hidden, top_k, num_tokens = [256, 128, 384, 128, 512], 256, 2, 300
+    x, _, _, w_gate, w_up, w_down, _, plan, _ = _inputs(
+        widths, hidden, top_k, num_tokens)
+    dev = x.device
+    top_e = torch.randint(0, 2, (num_tokens, top_k), device=dev, dtype=torch.int32)
+    top_e[:, 1] = 4
+    top_e[:5, 1] = 3
+    top_w = torch.full((num_tokens * top_k,), 0.5, device=dev, dtype=torch.bfloat16)
+    with torch.no_grad():
+        fwd = grouped_moe_module._forward_impl(
+            x, top_w, top_e.flatten(), w_gate, w_up, w_down, None, plan, top_k,
+            'cute', True, 'ceil', False)
+    route_tokens, counts, row_start = fwd[2], fwd[5], fwd[6]
+    rows = route_tokens.numel()
+    # Padding rows of dg and du are exact zeros, as _dgu writes them. Rows past
+    # the last claimed tile hold unwritten route tokens.
+    live = torch.zeros(rows, 1, device=dev, dtype=torch.bool)
+    for start, count in zip(row_start.tolist(), counts.tolist()):
+        live[start:start + count] = True
+    dg = torch.randn(rows, plan.max_width, device=dev, dtype=torch.bfloat16) * live
+    du = torch.randn(rows, plan.max_width, device=dev, dtype=torch.bfloat16) * live
+    xg = x.detach()[torch.where(live[:, 0], route_tokens, 0).long()].float() * live
+    want = []
+    for d in (dg, du):
+        w = torch.zeros(hidden, sum(widths), device=dev)
+        for e, (off, width) in enumerate(zip(plan.expert_col_off.tolist(), widths)):
+            r = slice(row_start[e].item(), row_start[e].item() + counts[e].item())
+            w[:, off:off + width] = xg[r].T @ d[r, :width].float()
+        want.append(w)
+    table = grouped_moe_module._wb_expert_table(plan, 128)
+    args = (route_tokens, table, plan.expert_col_off, counts, row_start)
+
+    fresh = [torch.full_like(w_gate, float('nan')) for _ in range(2)]
+    cute_wgrad_gather_pair(dg, du, x.detach(), args[0], *fresh, *args[1:])
+    zeros = [torch.zeros_like(w_gate) for _ in range(2)]
+    cute_wgrad_gather_pair(dg, du, x.detach(), args[0], *zeros, *args[1:],
+                           accumulate=True)
+    existing = [torch.randn_like(w_gate) for _ in range(2)]
+    acc = [t.clone() for t in existing]
+    cute_wgrad_gather_pair(dg, du, x.detach(), args[0], *acc, *args[1:],
+                           accumulate=True)
+    for f, z, e, a, w in zip(fresh, zeros, existing, acc, want):
+        assert _rel(f, w) < 1e-2
+        assert torch.equal(z, f)
+        assert _rel(a, e.float() + w) < 1e-2
+        # One rounding of the fp32 sum, not a sum of two rounded values.
+        assert (a.float() - (e.float() + w)).abs().max() <= (
+            ((e.float() + f.float()).to(torch.bfloat16).float()
+             - (e.float() + w)).abs().max())
+
+
+@pytest.mark.gpu
 @pytest.mark.parametrize('hidden', [64, 192, 384])
 def test_unsupported_hidden_raises(hidden):
     # These sizes would leave part of the output or weight gradients unwritten.

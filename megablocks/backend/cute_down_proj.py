@@ -37,7 +37,9 @@ Triton route planner. The shared Ampere pipeline implements three operations:
 * the fused gate+up input-gradient streams; and
 * the down-projection weight gradient.
 
-``_AmpereGateUpRows`` adds the forward gate and up projections with SwiGLU.
+``_AmpereGateUpRows`` adds the forward gate and up projections with SwiGLU,
+``_AmpereDgu`` the backward ``dout @ w_down.T`` with the SwiGLU backward, and
+``_AmpereWgradPair`` the gate and up weight gradients.
 
 One CuTe launch spans every expert tile, retains device-side expert selection,
 and never reads routing metadata back to the host.
@@ -639,6 +641,35 @@ class _AmpereRaggedDown:
                     slot[None, i, None],
                 )
 
+    # The helpers below stay undecorated: their Python loops run at trace time,
+    # so each thread's rows unroll into plain registers rather than a device loop
+    # over an rmem array.
+    def _gather_rows(self, x, route_tokens, tAsA, row0, tidx):
+        """One (is_token, x pointer) per row this thread copies; zeroes padding."""
+        chunks = self.bK // 8
+        thread_rows = self.num_threads // chunks
+        row = row0 + tidx // chunks
+        chunk = tidx % chunks
+        hidden = cute.size(x, mode=[1])
+        rows = []
+        for i in range(self.bM // thread_rows):
+            tok = route_tokens[row + i * thread_rows]
+            is_token = tok >= 0
+            slots = tAsA[None, i, None, None]
+            cutlass.if_generate(tok < 0, lambda s=slots: s.fill(0))
+            rows.append((is_token, x.iterator + (tok * hidden + chunk * 8)))
+        return rows
+
+    def _copy_x_tile(self, async_copy, rows, tAsA, k_tile, stage):
+        offset = k_tile * self.bK
+        for i, (is_token, ptr) in enumerate(rows):
+            src = cute.make_tensor((ptr + offset).align(16), (8,))
+            dst = tAsA[None, i, 0, stage]
+            cutlass.if_generate(
+                is_token,
+                lambda s=src, d=dst: cute.copy(async_copy, s, d),
+            )
+
     def _make_smem_layout_ab(self, dtype, major_mode, copy_bits, shape):
         major_size = shape[1] if major_mode == utils.LayoutEnum.ROW_MAJOR else shape[0]
         major_size = min(64, major_size)
@@ -1125,35 +1156,6 @@ class _AmpereGateUpRows(_AmpereRaggedDown):
             )
         return
 
-    # The helpers below stay undecorated: their Python loops run at trace time,
-    # so each thread's rows unroll into plain registers rather than a device loop
-    # over an rmem array.
-    def _gather_rows(self, x, route_tokens, tAsA, row0, tidx):
-        """One (is_token, x pointer) per row this thread copies; zeroes padding."""
-        chunks = self.bK // 8
-        thread_rows = self.num_threads // chunks
-        row = row0 + tidx // chunks
-        chunk = tidx % chunks
-        hidden = cute.size(x, mode=[1])
-        rows = []
-        for i in range(self.bM // thread_rows):
-            tok = route_tokens[row + i * thread_rows]
-            is_token = tok >= 0
-            slots = tAsA[None, i, None, None]
-            cutlass.if_generate(tok < 0, lambda s=slots: s.fill(0))
-            rows.append((is_token, x.iterator + (tok * hidden + chunk * 8)))
-        return rows
-
-    def _copy_x_tile(self, async_copy, rows, tAsA, k_tile, stage):
-        offset = k_tile * self.bK
-        for i, (is_token, ptr) in enumerate(rows):
-            src = cute.make_tensor((ptr + offset).align(16), (8,))
-            dst = tAsA[None, i, 0, stage]
-            cutlass.if_generate(
-                is_token,
-                lambda s=src, d=dst: cute.copy(async_copy, s, d),
-            )
-
     def _silu_epilogue(self, tiled_copy_C, tCrG, tCrU, tCgH, row_w, row0, tidx):
         # h comes from the bf16 values just stored, not the fp32 accumulators:
         # backward reads the stored g and u. These are the Triton kernels'
@@ -1180,6 +1182,817 @@ class _AmpereGateUpRows(_AmpereRaggedDown):
         cute.copy(tiled_copy_C, tCrH, tCgH)
 
 
+class _AmpereDgu(_AmpereRaggedDown):
+    """``da = dout[tok(row)] @ w_down.T`` with the SwiGLU backward fused.
+
+    grouped_moe's Triton ``_dgu`` describes the math. dout rows are gathered as
+    ``_AmpereGateUpRows`` gathers x; padding rows keep the zeros written once per
+    tile, so their da is exact zero.
+
+    g and u are read through smem. 128-bit ``cp.async`` copies put them in the
+    pipeline stages that the last two K tiles no longer write, so they arrive
+    while the MMAs run. A g or u tile is as large as one stage of A and B
+    together: its first half of rows sits in stage s of A and the rest in stage
+    s of B. dg and du overwrite g and u in place, h goes to a third stage, and
+    all three leave through 128-bit stores.
+
+    A row's columns span the atom's N warps. Each warp sums its share of the
+    routing-weight dot and writes its own ``dw_part`` column, in place of a
+    cross-warp reduction.
+    """
+
+    def __init__(self, cfg, fuse_h):
+        bm, bn, bk, stages, atom = cfg
+        super().__init__((bm, bn, bk), stages, tuple(atom), "down")
+        if bm != bn or bn != 2 * bk or stages < 3:
+            raise ValueError("the g/u staging needs BLOCK_M = BLOCK_N = 2 * BLOCK_K "
+                             "and 3+ stages")
+        self.fuse_h = fuse_h
+        self.parts_per_tile = atom[1]
+
+    @cute.jit
+    def __call__(
+        self,
+        dout: cute.Tensor,
+        w_down: cute.Tensor,
+        g: cute.Tensor,
+        u: cute.Tensor,
+        row_w: cute.Tensor,
+        dg: cute.Tensor,
+        du: cute.Tensor,
+        dw_part: cute.Tensor,
+        h: cute.Tensor,
+        route_tokens: cute.Tensor,
+        tile_expert: cute.Tensor,
+        expert_col_off: cute.Tensor,
+        expert_nblocks: cute.Tensor,
+        width_block: cutlass.Constexpr,
+        stream: cuda_driver.CUstream,
+    ):
+        major = utils.LayoutEnum.ROW_MAJOR
+        copy_bits = 128
+        sA_layout = self._make_smem_layout_ab(
+            dout.element_type, major, copy_bits,
+            (self.bM, self.bK, self.num_stages),
+        )
+        sB_layout = self._make_smem_layout_ab(
+            w_down.element_type, major, copy_bits,
+            (self.bN, self.bK, self.num_stages),
+        )
+        async_copy = cute.make_copy_atom(
+            cute.nvgpu.cpasync.CopyG2SOp(
+                cache_mode=cute.nvgpu.LoadCacheMode.GLOBAL,
+            ),
+            dout.element_type,
+            num_bits_per_copy=copy_bits,
+        )
+        tiled_copy_A = self._make_gmem_tiled_copy_ab(
+            async_copy, dout.element_type, major, copy_bits, self.bM,
+        )
+        tiled_copy_B = self._make_gmem_tiled_copy_ab(
+            async_copy, w_down.element_type, major, copy_bits, self.bN,
+        )
+        tiled_copy_gu = self._make_gmem_tiled_copy_c(
+            async_copy, g.element_type, major, copy_bits,
+        )
+        sync_copy = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            dg.element_type,
+            num_bits_per_copy=copy_bits,
+        )
+        tiled_copy_C = self._make_gmem_tiled_copy_c(
+            sync_copy, dg.element_type, major, copy_bits,
+        )
+        mma_op = cute.nvgpu.warp.MmaF16BF16Op(
+            dout.element_type, cutlass.Float32, self.mma_inst_shape,
+        )
+        tiled_mma = cute.make_tiled_mma(
+            mma_op,
+            cute.make_layout(self.atom_layout_mnk),
+            permutation_mnk=(
+                self.atom_layout_mnk[0] * self.mma_inst_shape[0],
+                self.atom_layout_mnk[1] * self.mma_inst_shape[1] * 2,
+                self.atom_layout_mnk[2] * self.mma_inst_shape[2],
+            ),
+        )
+        self.kernel(
+            dout,
+            w_down,
+            g,
+            u,
+            row_w,
+            dg,
+            du,
+            dw_part,
+            h,
+            route_tokens,
+            tile_expert,
+            expert_col_off,
+            expert_nblocks,
+            sA_layout,
+            sB_layout,
+            async_copy,
+            tiled_copy_A,
+            tiled_copy_B,
+            tiled_copy_gu,
+            tiled_copy_C,
+            tiled_mma,
+            width_block,
+        ).launch(
+            # The width tile advances fastest, so a row tile's CTAs run side by
+            # side and share its dout rows through L2.
+            grid=(
+                cute.ceil_div(g.shape[1], self.bN),
+                cute.ceil_div(g.shape[0], self.bM),
+                1,
+            ),
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        dout: cute.Tensor,
+        w_down: cute.Tensor,
+        g: cute.Tensor,
+        u: cute.Tensor,
+        row_w: cute.Tensor,
+        dg: cute.Tensor,
+        du: cute.Tensor,
+        dw_part: cute.Tensor,
+        h: cute.Tensor,
+        route_tokens: cute.Tensor,
+        tile_expert: cute.Tensor,
+        expert_col_off: cute.Tensor,
+        expert_nblocks: cute.Tensor,
+        sA_layout: cute.ComposedLayout,
+        sB_layout: cute.ComposedLayout,
+        async_copy: cute.CopyAtom,
+        tiled_copy_A: cute.TiledCopy,
+        tiled_copy_B: cute.TiledCopy,
+        tiled_copy_gu: cute.TiledCopy,
+        tiled_copy_C: cute.TiledCopy,
+        tiled_mma: cute.TiledMma,
+        width_block: cutlass.Constexpr,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        nt, mt, _ = cute.arch.block_idx()
+        expert = tile_expert[mt]
+
+        if expert < 0:
+            pass
+        elif nt * self.bN >= expert_nblocks[expert] * width_block:
+            pass
+        else:
+            gB = cute.local_tile(
+                cute.domain_offset((expert_col_off[expert], 0), w_down),
+                tiler=(self.bN, self.bK),
+                coord=(nt, None),
+            )
+            gB = cute.make_tensor(gB.iterator.align(16), gB.layout)
+            gG = cute.local_tile(g, tiler=(self.bM, self.bN), coord=(mt, nt))
+            gU = cute.local_tile(u, tiler=(self.bM, self.bN), coord=(mt, nt))
+            gG = cute.make_tensor(gG.iterator.align(16), gG.layout)
+            gU = cute.make_tensor(gU.iterator.align(16), gU.layout)
+            gDg = cute.local_tile(dg, tiler=(self.bM, self.bN), coord=(mt, nt))
+            gDu = cute.local_tile(du, tiler=(self.bM, self.bN), coord=(mt, nt))
+
+            @cute.struct
+            class SharedStorageAB:
+                a: cute.struct.Align[
+                    cute.struct.MemRange[dout.element_type, cute.cosize(sA_layout)],
+                    16,
+                ]
+                b: cute.struct.Align[
+                    cute.struct.MemRange[
+                        w_down.element_type, cute.cosize(sB_layout),
+                    ],
+                    16,
+                ]
+
+            smem = utils.SmemAllocator()
+            storage = smem.allocate(
+                SharedStorageAB.size_in_bytes(), byte_alignment=16,
+            )
+            sA = SharedStorageAB(storage).a.get_tensor(sA_layout)
+            sB = SharedStorageAB(storage).b.get_tensor(sB_layout)
+            # (row, col, stage): a tile's rows split between stage s of A and
+            # stage s of B, which sit one whole A pipeline apart.
+            sGU = cute.make_tensor(
+                sA.iterator,
+                cute.make_composed_layout(
+                    cute.make_swizzle(3, 3, 4),
+                    0,
+                    cute.make_layout(
+                        ((self.bM // 2, 2), self.bN, self.num_stages),
+                        stride=(
+                            (self.bN, cute.cosize(sA_layout)),
+                            1,
+                            self.bM * self.bK,
+                        ),
+                    ),
+                ),
+            )
+
+            thr_copy_A = tiled_copy_A.get_slice(tidx)
+            thr_copy_B = tiled_copy_B.get_slice(tidx)
+            thr_copy_gu = tiled_copy_gu.get_slice(tidx)
+            tAsA = thr_copy_A.partition_D(sA)
+            tBgB = thr_copy_B.partition_S(gB)
+            tBsB = thr_copy_B.partition_D(sB)
+            tGgG = thr_copy_gu.partition_S(gG)
+            tGgU = thr_copy_gu.partition_S(gU)
+            tGsGU = thr_copy_gu.partition_D(sGU)
+
+            thr_mma = tiled_mma.get_slice(tidx)
+            tCsA = thr_mma.partition_A(sA)
+            tCsB = thr_mma.partition_B(sB)
+            tCrA = tiled_mma.make_fragment_A(tCsA[None, None, None, 0])
+            tCrB = tiled_mma.make_fragment_B(tCsB[None, None, None, 0])
+            tCrC = tiled_mma.make_fragment_C(thr_mma.partition_C(gDg))
+            tCrC.fill(0.0)
+
+            copy_s2r = cute.make_copy_atom(
+                cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 4), dout.element_type,
+            )
+            tiled_copy_s2r_A = cute.make_tiled_copy_A(copy_s2r, tiled_mma)
+            tiled_copy_s2r_B = cute.make_tiled_copy_B(copy_s2r, tiled_mma)
+            thr_s2r_A = tiled_copy_s2r_A.get_slice(tidx)
+            thr_s2r_B = tiled_copy_s2r_B.get_slice(tidx)
+            tCsA_copy = thr_s2r_A.partition_S(sA)
+            tCrA_copy = thr_s2r_A.retile(tCrA)
+            tCsB_copy = thr_s2r_B.partition_S(sB)
+            tCrB_copy = thr_s2r_B.retile(tCrB)
+
+            rows = self._gather_rows(dout, route_tokens, tAsA, mt * self.bM, tidx)
+
+            k_tile_count = cute.size(w_down, mode=[1]) // self.bK
+            num_smem_stages = self.num_stages
+            k_tile_index = cutlass.Int32(0)
+            for stage in range(num_smem_stages - 1):
+                self._copy_x_tile(async_copy, rows, tAsA, k_tile_index, stage)
+                cute.copy(
+                    tiled_copy_B,
+                    tBgB[None, None, None, k_tile_index],
+                    tBsB[None, None, None, stage],
+                )
+                cute.arch.cp_async_commit_group()
+                k_tile_index = k_tile_index + 1
+
+            smem_pipe_read = 0
+            smem_pipe_write = num_smem_stages - 1
+            tCsA_p = tCsA_copy[None, None, None, smem_pipe_read]
+            tCsB_p = tCsB_copy[None, None, None, smem_pipe_read]
+            num_k_block = cute.size(tCrA, mode=[2])
+
+            if num_k_block > 1:
+                cute.arch.cp_async_wait_group(num_smem_stages - 2)
+                cute.arch.sync_threads()
+                cute.copy(tiled_copy_s2r_A, tCsA_p[None, None, 0],
+                          tCrA_copy[None, None, 0])
+                cute.copy(tiled_copy_s2r_B, tCsB_p[None, None, 0],
+                          tCrB_copy[None, None, 0])
+
+            for k_tile in range(k_tile_count):
+                for k_block in cutlass.range(num_k_block, unroll_full=True):
+                    if k_block == num_k_block - 1:
+                        tCsA_p = tCsA_copy[None, None, None, smem_pipe_read]
+                        tCsB_p = tCsB_copy[None, None, None, smem_pipe_read]
+                        cute.arch.cp_async_wait_group(num_smem_stages - 2)
+                        cute.arch.sync_threads()
+
+                    k_block_next = (k_block + 1) % num_k_block
+                    cute.copy(tiled_copy_s2r_A, tCsA_p[None, None, k_block_next],
+                              tCrA_copy[None, None, k_block_next])
+                    cute.copy(tiled_copy_s2r_B, tCsB_p[None, None, k_block_next],
+                              tCrB_copy[None, None, k_block_next])
+
+                    if k_block == 0:
+                        if k_tile + num_smem_stages - 1 < k_tile_count:
+                            self._copy_x_tile(
+                                async_copy, rows, tAsA, k_tile_index,
+                                smem_pipe_write,
+                            )
+                            cute.copy(
+                                tiled_copy_B,
+                                tBgB[None, None, None, k_tile_index],
+                                tBsB[None, None, None, smem_pipe_write],
+                            )
+                        elif k_tile + num_smem_stages - 1 == k_tile_count:
+                            # The last K tiles write no operands; their stages
+                            # take g and then u.
+                            cute.copy(
+                                tiled_copy_gu, tGgG,
+                                tGsGU[None, None, None, smem_pipe_write],
+                            )
+                        elif k_tile + num_smem_stages - 2 == k_tile_count:
+                            cute.copy(
+                                tiled_copy_gu, tGgU,
+                                tGsGU[None, None, None, smem_pipe_write],
+                            )
+                        # Commit even an empty group: the wait above counts
+                        # groups.
+                        k_tile_index = k_tile_index + 1
+                        cute.arch.cp_async_commit_group()
+                        smem_pipe_write = smem_pipe_read
+                        smem_pipe_read = smem_pipe_read + 1
+                        if smem_pipe_read == num_smem_stages:
+                            smem_pipe_read = 0
+
+                    cute.gemm(tiled_mma, tCrC, tCrA[None, None, k_block],
+                              tCrB[None, None, k_block], tCrC)
+
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.sync_threads()
+
+            # K tile t lands in stage t % stages, so g, copied where tile
+            # k_tile_count would go, is in stage k_tile_count % stages.
+            sG = sGU[None, None, k_tile_count % self.num_stages]
+            sU = sGU[None, None, (k_tile_count + 1) % self.num_stages]
+            sH = sGU[None, None, (k_tile_count + 2) % self.num_stages]
+
+            row_base = mt * self.bM
+            # Rows are the only thing these index, so their columns have stride 0.
+            tCgW = thr_mma.partition_C(
+                cute.make_tensor(
+                    row_w.iterator + row_base,
+                    cute.make_layout((self.bM, self.bN), stride=(1, 0)),
+                ),
+            )
+            num_part = cute.size(dw_part, mode=[1])
+            warps_per_part = self.atom_layout_mnk[0]
+            tCgP = thr_mma.partition_C(
+                cute.make_tensor(
+                    dw_part.iterator
+                    + row_base * num_part
+                    + nt * self.parts_per_tile
+                    + tidx // (32 * warps_per_part),
+                    cute.make_layout((self.bM, self.bN), stride=(num_part, 0)),
+                ),
+            )
+            self._swiglu_epilogue(
+                tCrC,
+                thr_mma.partition_C(sG),
+                thr_mma.partition_C(sU),
+                thr_mma.partition_C(sH),
+                tCgW,
+                tCgP,
+                tidx,
+            )
+            cute.arch.sync_threads()
+
+            thr_copy_C = tiled_copy_C.get_slice(tidx)
+            self._store_tile(tiled_copy_C, thr_copy_C, sG, gDg)
+            self._store_tile(tiled_copy_C, thr_copy_C, sU, gDu)
+            if cutlass.const_expr(self.fuse_h):
+                self._store_tile(
+                    tiled_copy_C, thr_copy_C, sH,
+                    cute.local_tile(h, tiler=(self.bM, self.bN), coord=(mt, nt)),
+                )
+        return
+
+    def _store_tile(self, tiled_copy_C, thr_copy_C, s, gD):
+        tEsD = thr_copy_C.partition_S(s)
+        tErD = cute.make_fragment_like(tEsD)
+        cute.autovec_copy(tEsD, tErD)
+        cute.copy(tiled_copy_C, tErD, thr_copy_C.partition_D(gD))
+
+    @cute.jit
+    def _swiglu_epilogue(self, tCrC, tCsG, tCsU, tCsH, tCgW, tCgP, tidx):
+        # One thread holds ((2, 2), M, N): pairs of columns on two rows 8 apart,
+        # over M row and N column blocks. Rows are the lower modes of the linear
+        # index, so a row's elements in this thread are the ones sharing (r, m).
+        n_m = cute.size(tCrC, mode=[1])
+        n_n = cute.size(tCrC, mode=[2])
+        n_rows = 2 * n_m
+        weights = [None] * n_rows
+        parts = [None] * n_rows
+        for j in cutlass.range_constexpr(n_rows):
+            weights[j] = tCgW[2 * (j % 2) + 4 * (j // 2)]
+        one = cutlass.Float32(1.0)
+        log2e = cutlass.Float32(1.4426950408889634)
+
+        def swiglu(acc, gg, uu, w):
+            # Triton's sigmoid: mul + ex2.approx, then div.full, as in
+            # _AmpereGateUpRows._silu_epilogue. The operation order is _dgu's.
+            sig = cute.math.div(
+                one, one + cute.math.exp2(-gg * log2e, approx=True), full=True,
+            )
+            silu = gg * sig
+            dh = acc * w
+            return (
+                ((dh * uu) * (sig * (one + gg * (one - sig)))).to(cutlass.BFloat16),
+                (dh * silu).to(cutlass.BFloat16),
+                acc * silu * uu,
+                (silu * uu * w).to(cutlass.BFloat16),
+            )
+
+        for n in cutlass.range_constexpr(n_n):
+            for m in cutlass.range_constexpr(n_m):
+                for r in cutlass.range_constexpr(2):
+                    j = r + 2 * m
+                    i = 2 * r + 4 * m + 4 * n_m * n
+                    # A pair is read and written together so that LLVM merges
+                    # each into one 32-bit smem access.
+                    g0 = tCsG[i].to(cutlass.Float32)
+                    g1 = tCsG[i + 1].to(cutlass.Float32)
+                    u0 = tCsU[i].to(cutlass.Float32)
+                    u1 = tCsU[i + 1].to(cutlass.Float32)
+                    dg0, du0, p0, h0 = swiglu(tCrC[i], g0, u0, weights[j])
+                    dg1, du1, p1, h1 = swiglu(tCrC[i + 1], g1, u1, weights[j])
+                    tCsG[i] = dg0
+                    tCsG[i + 1] = dg1
+                    tCsU[i] = du0
+                    tCsU[i + 1] = du1
+                    if cutlass.const_expr(self.fuse_h):
+                        tCsH[i] = h0
+                        tCsH[i + 1] = h1
+                    parts[j] = (
+                        p0 + p1
+                        if cutlass.const_expr(parts[j] is None)
+                        else parts[j] + p0 + p1
+                    )
+        # All four lanes of a quad hold the same rows, and butterfly shuffles
+        # give each the same bits regardless of timing.
+        for j in cutlass.range_constexpr(n_rows):
+            parts[j] = cute.arch.warp_reduction_sum(parts[j], threads_in_group=4)
+        if tidx % 4 == 0:
+            for j in cutlass.range_constexpr(n_rows):
+                tCgP[2 * (j % 2) + 4 * (j // 2)] = parts[j]
+
+
+class _AmpereWgradPair(_AmpereRaggedDown):
+    """dWg = x[tok]^T @ dg and dWu = x[tok]^T @ du in one launch, reading x once.
+
+    One CTA owns a (hidden, width) tile of both weights and keeps two fp32
+    accumulators. The K loop runs over the expert's rows, in order, and stops at
+    the route count rounded up to the K tile, as grouped_moe's ``_wgrad_gather``
+    does. Each copy thread gathers its K row of x from ``x[route_tokens[row]]``;
+    a padding row skips the copy, and dg and du are exact zeros there, so the
+    stale slot adds nothing as long as x is finite.
+
+    With ``accumulate`` the results are added to the outputs' contents in fp32
+    and rounded once.
+    """
+
+    def __init__(self, cfg, accumulate=False):
+        bm, bn, bk, stages, atom = cfg
+        super().__init__((bm, bn, bk), stages, tuple(atom), "down")
+        self.accumulate = accumulate
+
+    @cute.jit
+    def __call__(
+        self,
+        x: cute.Tensor,
+        dg: cute.Tensor,
+        du: cute.Tensor,
+        dwg: cute.Tensor,
+        dwu: cute.Tensor,
+        route_tokens: cute.Tensor,
+        weight_block_expert: cute.Tensor,
+        expert_col_off: cute.Tensor,
+        counts: cute.Tensor,
+        expert_row_start: cute.Tensor,
+        stream: cuda_driver.CUstream,
+    ):
+        # dg and du are [rows, max_width]; as (width, rows) they are the B
+        # operand with N contiguous. x^T is (hidden, tokens) with M contiguous.
+        dg_t = cute.make_tensor(dg.iterator, cute.select(dg.layout, mode=[1, 0]))
+        du_t = cute.make_tensor(du.iterator, cute.select(du.layout, mode=[1, 0]))
+        mn_major = utils.LayoutEnum.COL_MAJOR
+        copy_bits = 128
+        sA_layout = self._make_smem_layout_ab(
+            x.element_type, mn_major, copy_bits,
+            (self.bM, self.bK, self.num_stages),
+        )
+        sB_layout = self._make_smem_layout_ab(
+            dg.element_type, mn_major, copy_bits,
+            (self.bN, self.bK, self.num_stages),
+        )
+        sC_layout = self._make_smem_layout_c(
+            dwg.element_type, utils.LayoutEnum.ROW_MAJOR, copy_bits,
+            (self.bM, self.bN),
+        )
+        async_copy = cute.make_copy_atom(
+            cute.nvgpu.cpasync.CopyG2SOp(
+                cache_mode=cute.nvgpu.LoadCacheMode.GLOBAL,
+            ),
+            x.element_type,
+            num_bits_per_copy=copy_bits,
+        )
+        # Each copy thread owns one K row of the x tile: one route token per
+        # stage. See _gather_k_row.
+        per_row = self.num_threads // self.bK
+        tiled_copy_A = cute.make_tiled_copy_tv(
+            async_copy,
+            cute.make_layout((per_row, self.bK), stride=(1, per_row)),
+            cute.make_layout((copy_bits // x.element_type.width, 1)),
+        )
+        tiled_copy_B = self._make_gmem_tiled_copy_ab(
+            async_copy, dg.element_type, mn_major, copy_bits, self.bN,
+        )
+        sync_copy = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            dwg.element_type,
+            num_bits_per_copy=copy_bits,
+        )
+        tiled_copy_C = self._make_gmem_tiled_copy_c(
+            sync_copy, dwg.element_type, utils.LayoutEnum.ROW_MAJOR, copy_bits,
+        )
+        mma_op = cute.nvgpu.warp.MmaF16BF16Op(
+            x.element_type, cutlass.Float32, self.mma_inst_shape,
+        )
+        tiled_mma = cute.make_tiled_mma(
+            mma_op,
+            cute.make_layout(self.atom_layout_mnk),
+            permutation_mnk=(
+                self.atom_layout_mnk[0] * self.mma_inst_shape[0],
+                self.atom_layout_mnk[1] * self.mma_inst_shape[1] * 2,
+                self.atom_layout_mnk[2] * self.mma_inst_shape[2],
+            ),
+        )
+        self.kernel(
+            x,
+            dg_t,
+            du_t,
+            dwg,
+            dwu,
+            route_tokens,
+            weight_block_expert,
+            expert_col_off,
+            counts,
+            expert_row_start,
+            sA_layout,
+            sB_layout,
+            sC_layout,
+            async_copy,
+            tiled_copy_A,
+            tiled_copy_B,
+            tiled_copy_C,
+            tiled_mma,
+        ).launch(
+            # The hidden tile advances fastest, so a width block's CTAs run side
+            # by side and share its dg and du rows through L2.
+            grid=(
+                cute.ceil_div(dwg.shape[0], self.bM),
+                cute.ceil_div(dwg.shape[1], self.bN),
+                1,
+            ),
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        x: cute.Tensor,
+        dg_t: cute.Tensor,
+        du_t: cute.Tensor,
+        dwg: cute.Tensor,
+        dwu: cute.Tensor,
+        route_tokens: cute.Tensor,
+        weight_block_expert: cute.Tensor,
+        expert_col_off: cute.Tensor,
+        counts: cute.Tensor,
+        expert_row_start: cute.Tensor,
+        sA_layout: cute.ComposedLayout,
+        sB_layout: cute.ComposedLayout,
+        sC_layout: cute.ComposedLayout,
+        async_copy: cute.CopyAtom,
+        tiled_copy_A: cute.TiledCopy,
+        tiled_copy_B: cute.TiledCopy,
+        tiled_copy_C: cute.TiledCopy,
+        tiled_mma: cute.TiledMma,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        ht, wb, _ = cute.arch.block_idx()
+        expert = weight_block_expert[wb]
+        count = counts[expert]
+        row_start = expert_row_start[expert]
+        k_tile_count = cute.ceil_div(count, self.bK)
+        local_col = wb * self.bN - expert_col_off[expert]
+
+        gBg = cute.local_tile(
+            cute.domain_offset((local_col, row_start), dg_t),
+            tiler=(self.bN, self.bK),
+            coord=(0, None),
+        )
+        gBu = cute.local_tile(
+            cute.domain_offset((local_col, row_start), du_t),
+            tiler=(self.bN, self.bK),
+            coord=(0, None),
+        )
+        gBg = cute.make_tensor(gBg.iterator.align(16), gBg.layout)
+        gBu = cute.make_tensor(gBu.iterator.align(16), gBu.layout)
+        gCg = cute.local_tile(dwg, tiler=(self.bM, self.bN), coord=(ht, wb))
+        gCu = cute.local_tile(dwu, tiler=(self.bM, self.bN), coord=(ht, wb))
+
+        @cute.struct
+        class SharedStorageAB:
+            a: cute.struct.Align[
+                cute.struct.MemRange[x.element_type, cute.cosize(sA_layout)],
+                16,
+            ]
+            bg: cute.struct.Align[
+                cute.struct.MemRange[dg_t.element_type, cute.cosize(sB_layout)],
+                16,
+            ]
+            bu: cute.struct.Align[
+                cute.struct.MemRange[du_t.element_type, cute.cosize(sB_layout)],
+                16,
+            ]
+
+        @cute.struct
+        class SharedStorageC:
+            cg: cute.struct.Align[
+                cute.struct.MemRange[dwg.element_type, cute.cosize(sC_layout)],
+                16,
+            ]
+            cu: cute.struct.Align[
+                cute.struct.MemRange[dwu.element_type, cute.cosize(sC_layout)],
+                16,
+            ]
+
+        smem = utils.SmemAllocator()
+        storage = smem.allocate(
+            max(SharedStorageAB.size_in_bytes(), SharedStorageC.size_in_bytes()),
+            byte_alignment=16,
+        )
+        sA = SharedStorageAB(storage).a.get_tensor(sA_layout)
+        sBg = SharedStorageAB(storage).bg.get_tensor(sB_layout)
+        sBu = SharedStorageAB(storage).bu.get_tensor(sB_layout)
+        sCg = SharedStorageC(storage).cg.get_tensor(sC_layout)
+        sCu = SharedStorageC(storage).cu.get_tensor(sC_layout)
+
+        thr_copy_A = tiled_copy_A.get_slice(tidx)
+        thr_copy_B = tiled_copy_B.get_slice(tidx)
+        tAsA = thr_copy_A.partition_D(sA)
+        tBgBg = thr_copy_B.partition_S(gBg)
+        tBsBg = thr_copy_B.partition_D(sBg)
+        tBgBu = thr_copy_B.partition_S(gBu)
+        tBsBu = thr_copy_B.partition_D(sBu)
+
+        thr_mma = tiled_mma.get_slice(tidx)
+        tCsA = thr_mma.partition_A(sA)
+        tCsBg = thr_mma.partition_B(sBg)
+        tCsBu = thr_mma.partition_B(sBu)
+        tCrA = tiled_mma.make_fragment_A(tCsA[None, None, None, 0])
+        tCrBg = tiled_mma.make_fragment_B(tCsBg[None, None, None, 0])
+        tCrBu = tiled_mma.make_fragment_B(tCsBu[None, None, None, 0])
+        tCrCg = tiled_mma.make_fragment_C(thr_mma.partition_C(gCg))
+        tCrCu = tiled_mma.make_fragment_C(thr_mma.partition_C(gCu))
+        tCrCg.fill(0.0)
+        tCrCu.fill(0.0)
+
+        copy_s2r = cute.make_copy_atom(
+            cute.nvgpu.warp.LdMatrix8x8x16bOp(True, 4), x.element_type,
+        )
+        tiled_copy_s2r_A = cute.make_tiled_copy_A(copy_s2r, tiled_mma)
+        tiled_copy_s2r_B = cute.make_tiled_copy_B(copy_s2r, tiled_mma)
+        thr_s2r_A = tiled_copy_s2r_A.get_slice(tidx)
+        thr_s2r_B = tiled_copy_s2r_B.get_slice(tidx)
+        tCsA_copy = thr_s2r_A.partition_S(sA)
+        tCrA_copy = thr_s2r_A.retile(tCrA)
+        tCsBg_copy = thr_s2r_B.partition_S(sBg)
+        tCrBg_copy = thr_s2r_B.retile(tCrBg)
+        tCsBu_copy = thr_s2r_B.partition_S(sBu)
+        tCrBu_copy = thr_s2r_B.retile(tCrBu)
+
+        # A padding row never copies its x slot. Zero all of them once, so
+        # uninitialized smem cannot hold a NaN that multiplies a zero dg.
+        tAsA.fill(0)
+        cute.arch.sync_threads()
+
+        num_smem_stages = self.num_stages
+        k_tile_index = cutlass.Int32(0)
+        for stage in range(num_smem_stages - 1):
+            if k_tile_index < k_tile_count:
+                self._load_stage(
+                    async_copy, x, route_tokens, tAsA, tiled_copy_B, tBgBg,
+                    tBsBg, tBgBu, tBsBu, row_start, ht, k_tile_index, stage,
+                    tidx,
+                )
+            # Commit even an empty group: the waits below count groups, so with
+            # too few K tiles one would pass with this one still in flight.
+            cute.arch.cp_async_commit_group()
+            k_tile_index = k_tile_index + 1
+
+        smem_pipe_read = 0
+        smem_pipe_write = num_smem_stages - 1
+        tCsA_p = tCsA_copy[None, None, None, smem_pipe_read]
+        tCsBg_p = tCsBg_copy[None, None, None, smem_pipe_read]
+        tCsBu_p = tCsBu_copy[None, None, None, smem_pipe_read]
+        num_k_block = cute.size(tCrA, mode=[2])
+
+        if num_k_block > 1:
+            cute.arch.cp_async_wait_group(num_smem_stages - 2)
+            cute.arch.sync_threads()
+            cute.copy(tiled_copy_s2r_A, tCsA_p[None, None, 0],
+                      tCrA_copy[None, None, 0])
+            cute.copy(tiled_copy_s2r_B, tCsBg_p[None, None, 0],
+                      tCrBg_copy[None, None, 0])
+            cute.copy(tiled_copy_s2r_B, tCsBu_p[None, None, 0],
+                      tCrBu_copy[None, None, 0])
+
+        for k_tile in range(k_tile_count):
+            for k_block in cutlass.range(num_k_block, unroll_full=True):
+                if k_block == num_k_block - 1:
+                    tCsA_p = tCsA_copy[None, None, None, smem_pipe_read]
+                    tCsBg_p = tCsBg_copy[None, None, None, smem_pipe_read]
+                    tCsBu_p = tCsBu_copy[None, None, None, smem_pipe_read]
+                    cute.arch.cp_async_wait_group(num_smem_stages - 2)
+                    cute.arch.sync_threads()
+
+                k_block_next = (k_block + 1) % num_k_block
+                cute.copy(tiled_copy_s2r_A, tCsA_p[None, None, k_block_next],
+                          tCrA_copy[None, None, k_block_next])
+                cute.copy(tiled_copy_s2r_B, tCsBg_p[None, None, k_block_next],
+                          tCrBg_copy[None, None, k_block_next])
+                cute.copy(tiled_copy_s2r_B, tCsBu_p[None, None, k_block_next],
+                          tCrBu_copy[None, None, k_block_next])
+
+                if k_block == 0:
+                    if k_tile + num_smem_stages - 1 < k_tile_count:
+                        self._load_stage(
+                            async_copy, x, route_tokens, tAsA, tiled_copy_B,
+                            tBgBg, tBsBg, tBgBu, tBsBu, row_start, ht,
+                            k_tile_index, smem_pipe_write, tidx,
+                        )
+                    k_tile_index = k_tile_index + 1
+                    cute.arch.cp_async_commit_group()
+                    smem_pipe_write = smem_pipe_read
+                    smem_pipe_read = smem_pipe_read + 1
+                    if smem_pipe_read == num_smem_stages:
+                        smem_pipe_read = 0
+
+                cute.gemm(tiled_mma, tCrCg, tCrA[None, None, k_block],
+                          tCrBg[None, None, k_block], tCrCg)
+                cute.gemm(tiled_mma, tCrCu, tCrA[None, None, k_block],
+                          tCrBu[None, None, k_block], tCrCu)
+
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.sync_threads()
+
+        thr_copy_C = tiled_copy_C.get_slice(tidx)
+        for acc, sC, gC in ((tCrCg, sCg, gCg), (tCrCu, sCu, gCu)):
+            tCsC = thr_mma.partition_C(sC)
+            tCsC_epilogue = thr_copy_C.partition_S(sC)
+            tCgC_epilogue = thr_copy_C.partition_D(gC)
+            tCrD = cute.make_fragment_like(acc, dwg.element_type)
+            if cutlass.const_expr(self.accumulate):
+                # Stage the existing tile through smem with coalesced loads,
+                # then read it in the accumulator's layout.
+                tCrE = cute.make_fragment_like(tCsC_epilogue)
+                cute.copy(tiled_copy_C, tCgC_epilogue, tCrE)
+                cute.autovec_copy(tCrE, tCsC_epilogue)
+                cute.arch.sync_threads()
+                cute.autovec_copy(tCsC, tCrD)
+                # Each thread overwrites only the elements it read.
+                tCrD[None] = (
+                    acc.load() + tCrD.load().to(cutlass.Float32)
+                ).to(dwg.element_type)
+            else:
+                tCrD[None] = acc.load().to(dwg.element_type)
+            cute.autovec_copy(tCrD, tCsC)
+        cute.arch.sync_threads()
+        for sC, gC in ((sCg, gCg), (sCu, gCu)):
+            tCsC_epilogue = thr_copy_C.partition_S(sC)
+            tCrC_epilogue = cute.make_fragment_like(tCsC_epilogue)
+            cute.autovec_copy(tCsC_epilogue, tCrC_epilogue)
+            cute.copy(tiled_copy_C, tCrC_epilogue, thr_copy_C.partition_D(gC))
+        return
+
+    def _load_stage(self, async_copy, x, route_tokens, tAsA, tiled_copy_B,
+                    tBgBg, tBsBg, tBgBu, tBsBu, row_start, ht, k_tile, stage,
+                    tidx):
+        self._gather_k_row(async_copy, x, route_tokens, tAsA[None, None, None, stage],
+                           row_start + k_tile * self.bK, ht, tidx)
+        cute.copy(tiled_copy_B, tBgBg[None, None, None, k_tile],
+                  tBsBg[None, None, None, stage])
+        cute.copy(tiled_copy_B, tBgBu[None, None, None, k_tile],
+                  tBsBu[None, None, None, stage])
+
+    def _gather_k_row(self, async_copy, x, route_tokens, slot, row0, ht, tidx):
+        # This thread's K row of one stage, x[token][ht * bM + ...]. slot is its
+        # (V, chunks, 1) view of the stage.
+        per_row = self.num_threads // self.bK
+        chunk_elems = 8
+        tok = route_tokens[row0 + tidx // per_row]
+        hidden = cute.size(x, mode=[1])
+        src = (x.iterator + tok * hidden + ht * self.bM
+               + (tidx % per_row) * chunk_elems)
+        layout = cute.make_layout((chunk_elems, 1))
+        for i in range(self.bM // (chunk_elems * per_row)):
+            ptr = src + i * per_row * chunk_elems
+            s_src = cute.make_tensor(ptr.align(16), layout)
+            dst = slot[None, i, None]
+            cutlass.if_generate(
+                tok >= 0,
+                lambda s=s_src, d=dst: cute.copy(async_copy, s, d),
+            )
+
+
 @dataclass
 class _CompiledKernel:
     fn: object
@@ -1190,6 +2003,22 @@ _CACHE: dict[tuple, _CompiledKernel] = {}
 _DX_FUSED_CACHE: dict[tuple, _CompiledKernel] = {}
 _WGRAD_CACHE: dict[tuple, _CompiledKernel] = {}
 _GATE_UP_CACHE: dict[tuple, _CompiledKernel] = {}
+_DGU_CACHE: dict[tuple, _CompiledKernel] = {}
+_WGRAD_PAIR_CACHE: dict[tuple, _CompiledKernel] = {}
+# Fused dWg + dWu: (BLOCK_M on hidden, BLOCK_N on the width, BLOCK_K on rows,
+# stages, MNK atom layout). At hidden 512 (128 experts x 512, 8192 tokens, top-k
+# 8) the launch took 0.78 ms against 0.83 ms for the two Triton launches; K64 with
+# two stages took 0.82, a 64-row hidden tile 1.00, and K16 1.01. One CuTe launch
+# per weight, through the wgrad mode with a transposed store, was 2-24% slower
+# than Triton.
+_WGRAD_PAIR_CFG = (128, 128, 32, 3, (2, 4, 1))
+# _dgu: (BLOCK_M, BLOCK_N on the width, BLOCK_K on hidden, stages, MNK atom
+# layout). The g/u staging needs BLOCK_M = BLOCK_N = 2 * BLOCK_K. At hidden 512
+# this took 0.76 ms against 1.18 ms for the Triton _dgu, and 1.16 against 1.34 at
+# hidden 2048. Atoms (2, 4, 1) and (8, 1, 1) took 0.77 and 0.78 ms. It uses 255
+# registers, one CTA per SM. K32 tiles with the epilogue in two column chunks fit
+# two CTAs per SM in 128 registers, but spilled and took 0.82-0.88 ms.
+_DGU_CFG = (128, 128, 64, 3, (4, 2, 1))
 # (BLOCK_M, BLOCK_N, BLOCK_K, stages, MNK atom layout). In sustained blocks at the
 # primary shape this took 1.65 ms; 2 stages 1.78, K16 2.15, and 16 warps 2.45.
 _GATE_UP_CFG = (128, 128, 32, 3, (2, 4, 1))
@@ -1606,4 +2435,243 @@ def cute_gate_up_rows(
         tile_expert,
         expert_col_off,
         expert_nblocks,
+    )
+
+
+def cute_dgu_parts(max_width: int, cfg: tuple | None = None) -> int:
+    """Columns of ``dw_part`` that ``cute_dgu`` writes: per width tile, one
+    partial dot per N warp of the MMA atom."""
+    bm, bn, bk, stages, atom = cfg or _DGU_CFG
+    return (max_width + bn - 1) // bn * atom[1]
+
+
+def cute_dgu(
+    dout: torch.Tensor,
+    w_down: torch.Tensor,
+    g: torch.Tensor,
+    u: torch.Tensor,
+    row_w: torch.Tensor,
+    dg: torch.Tensor,
+    du: torch.Tensor,
+    dw_part: torch.Tensor,
+    h: torch.Tensor | None,
+    route_tokens: torch.Tensor,
+    tile_expert: torch.Tensor,
+    expert_col_off: torch.Tensor,
+    expert_nblocks: torch.Tensor,
+    width_block: int,
+    cfg: tuple | None = None,
+) -> None:
+    """dg, du, the routing-weight partials and optionally h, as grouped_moe's
+    Triton ``_dgu`` computes them, on the current stream.
+
+    ``dw_part`` needs ``cute_dgu_parts(g.shape[1])`` columns, zero-initialized:
+    tiles past an expert's width do not run. Sum each row's columns in order.
+    """
+    tensors = (
+        dout,
+        w_down,
+        g,
+        u,
+        row_w,
+        dg,
+        du,
+        dw_part,
+        route_tokens,
+        tile_expert,
+        expert_col_off,
+        expert_nblocks,
+    ) + (() if h is None else (h,))
+    if not all(t.is_cuda and t.is_contiguous() for t in tensors):
+        raise ValueError("CuTe dgu tensors must be contiguous CUDA tensors")
+    if len({t.device for t in tensors}) != 1:
+        raise ValueError("CuTe dgu tensors must share a device")
+    if torch.cuda.get_device_capability(g.device)[0] != 8:
+        raise ValueError("CuTe Ampere dgu requires compute capability 8.x")
+    if any(t.dtype != torch.bfloat16 for t in (dout, w_down, g, u, dg, du)):
+        raise TypeError("CuTe Ampere dgu currently supports BF16 only")
+    if h is not None and (h.dtype != g.dtype or h.shape != g.shape):
+        raise ValueError("h must match g")
+    if row_w.dtype != torch.float32 or dw_part.dtype != torch.float32:
+        raise TypeError("row_w and dw_part must be float32")
+    if any(t.dtype != torch.int32 for t in tensors[8:12]):
+        raise TypeError("routing metadata tensors must be int32")
+    if g.ndim != 2 or g.shape != u.shape or g.shape != dg.shape or g.shape != du.shape:
+        raise ValueError("g, u, dg, and du must be matrices of one shape")
+    if route_tokens.numel() != g.shape[0] or row_w.numel() != g.shape[0]:
+        raise ValueError("route_tokens and row_w need one entry per row")
+    if tile_expert.numel() * 128 != g.shape[0]:
+        raise ValueError("tile_expert must contain one entry per 128 rows")
+    hidden = dout.shape[1]
+    if w_down.shape[1] != hidden or hidden % 256:
+        raise ValueError("hidden size must be a multiple of 256 and match w_down")
+    if dw_part.shape != (g.shape[0], cute_dgu_parts(g.shape[1], cfg)):
+        raise ValueError("dw_part must have cute_dgu_parts(max_width) columns")
+    if expert_col_off.shape != expert_nblocks.shape:
+        raise ValueError("expert metadata arrays must have the same shape")
+    bm, bn, bk, stages, atom = cfg or _DGU_CFG
+    # Expert widths are whole width blocks; a tile must not straddle two experts.
+    if width_block % bn or g.shape[1] % bn:
+        raise ValueError(f"the width block must be a multiple of {bn}")
+    # The gather's 16-byte async copies reject a contiguous view at an unaligned
+    # offset. A fresh allocation is aligned.
+    if dout.data_ptr() % 16:
+        dout = dout.clone()
+
+    fuse_h = h is not None
+    signature = (
+        g.device.index,
+        hidden,
+        tuple(w_down.shape),
+        g.shape[1],
+        width_block,
+        fuse_h,
+        (bm, bn, bk, stages, tuple(atom)),
+    )
+    compiled = _DGU_CACHE.get(signature)
+    if h is None:
+        h = g  # never written
+    if compiled is None:
+        args = (
+            _as_cute(dout, dynamic_dim0=True),
+            _as_cute(w_down),
+            _as_cute(g, dynamic_dim0=True, dim0_divisibility=128),
+            _as_cute(u, dynamic_dim0=True, dim0_divisibility=128),
+            _as_cute(row_w, dynamic_dim0=True),
+            _as_cute(dg, dynamic_dim0=True, dim0_divisibility=128),
+            _as_cute(du, dynamic_dim0=True, dim0_divisibility=128),
+            _as_cute(dw_part, dynamic_dim0=True, dim0_divisibility=128),
+            _as_cute(h, dynamic_dim0=True, dim0_divisibility=128),
+            _as_cute(route_tokens, dynamic_dim0=True),
+            _as_cute(tile_expert, dynamic_dim0=True),
+            _as_cute(expert_col_off, dynamic_dim0=True),
+            _as_cute(expert_nblocks, dynamic_dim0=True),
+        )
+        op = _AmpereDgu((bm, bn, bk, stages, tuple(atom)), fuse_h)
+        fn = cute.compile(op, *args, width_block, _ENV_STREAM,
+                          options="--enable-tvm-ffi")
+        compiled = _CompiledKernel(fn, signature)
+        _DGU_CACHE[signature] = compiled
+
+    _launch(
+        compiled,
+        dout,
+        w_down,
+        g,
+        u,
+        row_w,
+        dg,
+        du,
+        dw_part,
+        h,
+        route_tokens,
+        tile_expert,
+        expert_col_off,
+        expert_nblocks,
+    )
+
+
+def cute_wgrad_gather_pair(
+    dg: torch.Tensor,
+    du: torch.Tensor,
+    x: torch.Tensor,
+    route_tokens: torch.Tensor,
+    dwg: torch.Tensor,
+    dwu: torch.Tensor,
+    weight_block_expert: torch.Tensor,
+    expert_col_off: torch.Tensor,
+    counts: torch.Tensor,
+    expert_row_start: torch.Tensor,
+    accumulate: bool = False,
+    cfg: tuple | None = None,
+) -> None:
+    """``dwg = x[route_tokens].T @ dg`` and ``dwu = x[route_tokens].T @ du``,
+    packed by expert, in one launch.
+
+    The outputs are ``[hidden, total_width]``, like the gate and up weights. With
+    ``accumulate`` each result is added to the output's contents in fp32 and
+    rounded once, for gradient accumulation; otherwise the outputs are
+    overwritten.
+    """
+    tensors = (
+        dg,
+        du,
+        x,
+        dwg,
+        dwu,
+        route_tokens,
+        weight_block_expert,
+        expert_col_off,
+        counts,
+        expert_row_start,
+    )
+    if not all(t.is_cuda and t.is_contiguous() for t in tensors):
+        raise ValueError("CuTe weight-gradient tensors must be contiguous CUDA tensors")
+    if len({t.device for t in tensors}) != 1:
+        raise ValueError("CuTe weight-gradient tensors must share a device")
+    if torch.cuda.get_device_capability(dg.device)[0] != 8:
+        raise ValueError("CuTe Ampere weight gradient requires compute capability 8.x")
+    if any(t.dtype != torch.bfloat16 for t in tensors[:5]):
+        raise TypeError("CuTe Ampere weight gradient currently supports BF16 only")
+    if any(t.dtype != torch.int32 for t in tensors[5:]):
+        raise TypeError("route and expert metadata tensors must be int32")
+    if any(t.ndim != 2 for t in tensors[:5]):
+        raise ValueError("dg, du, x, dwg and dwu must be matrices")
+    if dg.shape != du.shape or dwg.shape != dwu.shape:
+        raise ValueError("dg and du, and dwg and dwu, must have matching shapes")
+    if dg.shape[0] != route_tokens.numel():
+        raise ValueError("route_tokens must contain one entry per dg row")
+    if dwg.shape[0] != x.shape[1] or dwg.shape[0] % 256:
+        raise ValueError("output hidden dimension must match x and be 256-aligned")
+    if dwg.shape[1] % 128 or weight_block_expert.numel() * 128 != dwg.shape[1]:
+        raise ValueError("weight_block_expert must contain one entry per 128 columns")
+    if expert_col_off.shape != counts.shape or counts.shape != expert_row_start.shape:
+        raise ValueError("expert metadata arrays must have the same shape")
+    # The gather's 16-byte async copies reject a contiguous view at an unaligned
+    # offset. A fresh allocation is aligned.
+    if x.data_ptr() % 16:
+        x = x.clone()
+
+    bm, bn, bk, stages, atom = cfg or _WGRAD_PAIR_CFG
+    if bn != 128 or dwg.shape[0] % bm or 128 % bk:
+        raise ValueError("the width tile must be 128 and the tiles must divide")
+    signature = (
+        dg.device.index,
+        dg.shape[1],
+        x.shape[1],
+        tuple(dwg.shape),
+        bool(accumulate),
+        (bm, bn, bk, stages, tuple(atom)),
+    )
+    compiled = _WGRAD_PAIR_CACHE.get(signature)
+    if compiled is None:
+        args = (
+            _as_cute(x, dynamic_dim0=True),
+            _as_cute(dg, dynamic_dim0=True, dim0_divisibility=128),
+            _as_cute(du, dynamic_dim0=True, dim0_divisibility=128),
+            _as_cute(dwg),
+            _as_cute(dwu),
+            _as_cute(route_tokens, dynamic_dim0=True),
+            _as_cute(weight_block_expert, dynamic_dim0=True),
+            _as_cute(expert_col_off, dynamic_dim0=True),
+            _as_cute(counts, dynamic_dim0=True),
+            _as_cute(expert_row_start, dynamic_dim0=True),
+        )
+        op = _AmpereWgradPair((bm, bn, bk, stages, tuple(atom)), bool(accumulate))
+        fn = cute.compile(op, *args, _ENV_STREAM, options="--enable-tvm-ffi")
+        compiled = _CompiledKernel(fn, signature)
+        _WGRAD_PAIR_CACHE[signature] = compiled
+
+    _launch(
+        compiled,
+        x,
+        dg,
+        du,
+        dwg,
+        dwu,
+        route_tokens,
+        weight_block_expert,
+        expert_col_off,
+        counts,
+        expert_row_start,
     )

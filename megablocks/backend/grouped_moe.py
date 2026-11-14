@@ -15,7 +15,8 @@ deliberate trade measured on a 3090: fusing gate+up (or dWg+dWu) into one kernel
 halves the gathered-x traffic, but the best fused gate+up tile still cost 0.13 ms
 over the whole step, measured before the alignment note below. The CuTe backend
 does fuse gate+up: with prefetch that kernel is 0.79 ms faster than the two
-Triton launches (`cute_gate_up_rows`).
+Triton launches (`cute_gate_up_rows`). It fuses dWg+dWu too, 0.05 ms faster
+than the two Triton launches over a sustained step (`cute_wgrad_gather_pair`).
 
 Forward routes with a stable counting sort -- `_count_blocks`, fused_moe's
 `_plan_tiles`, then `_scatter_routes_stable`, which also puts each routing
@@ -42,10 +43,12 @@ atomics, and a row layout that is a pure function of the routing):
 
   `_dgu`            da = gather(dout) @ Wd^T; per-tile partials of
                     dw_r = <da, silu(g) * u>; dh = w_r * da, then SwiGLU'
-                    in-register -> dg, du; h again if it was not retained
+                    in-register -> dg, du; h again if it was not retained.
+                    Triton or CuTe (`cute_dgu`)
   `_route_dw`       dw_r = sum of its row's partials, in tile order
   `_wgrad_rows`     Triton or CuTe h^T @ gather(dout) -> dWd
-  `_wgrad_gather`   dW = gather(x)^T @ dg -> dWg, and with du -> dWu
+  `_wgrad_gather`   dW = gather(x)^T @ dg -> dWg, and with du -> dWu; CuTe
+                    computes both in one launch
   `_dx_rows_fused`  dx_rows = dg @ Wg^T + du @ Wu^T, using one fp32
                     accumulator in either Triton or CuTe
   `_scatter_reduce` (unweighted) top-k sum of dx_rows into dx
@@ -1019,8 +1022,6 @@ def _backward_impl(dout, x, top_weights, w_gate, w_up, w_down,
     dg = torch.empty_like(g)
     du = torch.empty_like(u)
     dgu_nt = (plan.max_width + gn - 1) // gn
-    dw_part = torch.zeros((row_bound, dgu_nt), dtype=torch.float32,
-                          device=dev)
     # Transient when recomputed. Only the weight gradient reads h, and only
     # inside each expert's rows and width, which is what _dgu tiles over.
     h = (
@@ -1028,39 +1029,66 @@ def _backward_impl(dout, x, top_weights, w_gate, w_up, w_down,
         if recompute_activation
         else saved_h
     )
-    _dgu[(dgu_nt, m_tiles)](
-        dout,
-        w_down,
-        g,
-        u,
-        row_w,
-        dg,
-        du,
-        dw_part,
-        h,
-        route_tokens,
-        tile_expert,
-        plan.expert_col_off,
-        plan.expert_nblocks,
-        HIDDEN=hidden,
-        MAX_W=plan.max_width,
-        NUM_NT=dgu_nt,
-        WIDTH_BLOCK=bn,
-        BLOCK_M=gm,
-        BLOCK_N=gn,
-        BLOCK_K=gk,
-        FUSE_H=recompute_activation,
-        num_warps=gw,
-        num_stages=gs,
-    )
+    if down_proj_backend == 'cute':
+        from megablocks.backend.cute_down_proj import cute_dgu, cute_dgu_parts
+
+        # One partial per N warp of each width tile.
+        dw_cols = cute_dgu_parts(plan.max_width)
+        dw_part = torch.zeros((row_bound, dw_cols), dtype=torch.float32,
+                              device=dev)
+        cute_dgu(
+            dout,
+            w_down,
+            g,
+            u,
+            row_w,
+            dg,
+            du,
+            dw_part,
+            h if recompute_activation else None,
+            route_tokens,
+            tile_expert,
+            plan.expert_col_off,
+            plan.expert_nblocks,
+            bn,
+        )
+    else:
+        dw_cols = dgu_nt
+        dw_part = torch.zeros((row_bound, dw_cols), dtype=torch.float32,
+                              device=dev)
+        _dgu[(dgu_nt, m_tiles)](
+            dout,
+            w_down,
+            g,
+            u,
+            row_w,
+            dg,
+            du,
+            dw_part,
+            h,
+            route_tokens,
+            tile_expert,
+            plan.expert_col_off,
+            plan.expert_nblocks,
+            HIDDEN=hidden,
+            MAX_W=plan.max_width,
+            NUM_NT=dgu_nt,
+            WIDTH_BLOCK=bn,
+            BLOCK_M=gm,
+            BLOCK_N=gn,
+            BLOCK_K=gk,
+            FUSE_H=recompute_activation,
+            num_warps=gw,
+            num_stages=gs,
+        )
     dw_routes = torch.empty(num_routes, dtype=torch.float32, device=dev)
     _route_dw[(triton.cdiv(num_routes, 256),)](
         dw_routes,
         dw_part,
         route_rows,
         num_routes,
-        NUM_NT=dgu_nt,
-        BLOCK_NT=triton.next_power_of_2(dgu_nt),
+        NUM_NT=dw_cols,
+        BLOCK_NT=triton.next_power_of_2(dw_cols),
         BLOCK_X=256,
         num_warps=4,
     )
@@ -1100,29 +1128,45 @@ def _backward_impl(dout, x, top_weights, w_gate, w_up, w_down,
         )
     del h
 
-    ww, wh, wk, wwar, wst = _CFG['wgrad_gateup']
-    wb_expert = _wb_expert_table(plan, ww)
     dwg = torch.empty_like(w_gate)
     dwu = torch.empty_like(w_up)
-    for d_rows, dw in ((dg, dwg), (du, dwu)):
-        _wgrad_gather[(hidden // wh, plan.total_width // ww)](
+    if down_proj_backend == 'cute':
+        from megablocks.backend.cute_down_proj import cute_wgrad_gather_pair
+
+        cute_wgrad_gather_pair(
+            dg,
+            du,
             x,
-            d_rows,
-            dw,
             route_tokens,
-            wb_expert,
+            dwg,
+            dwu,
+            _wb_expert_table(plan, 128),
             plan.expert_col_off,
-            row_start,
             counts,
-            HIDDEN=hidden,
-            TOTAL_W=plan.total_width,
-            MAX_W=plan.max_width,
-            BLOCK_W=ww,
-            BLOCK_H=wh,
-            BLOCK_K=wk,
-            num_warps=wwar,
-            num_stages=wst,
+            row_start,
         )
+    else:
+        ww, wh, wk, wwar, wst = _CFG['wgrad_gateup']
+        wb_expert = _wb_expert_table(plan, ww)
+        for d_rows, dw in ((dg, dwg), (du, dwu)):
+            _wgrad_gather[(hidden // wh, plan.total_width // ww)](
+                x,
+                d_rows,
+                dw,
+                route_tokens,
+                wb_expert,
+                plan.expert_col_off,
+                row_start,
+                counts,
+                HIDDEN=hidden,
+                TOTAL_W=plan.total_width,
+                MAX_W=plan.max_width,
+                BLOCK_W=ww,
+                BLOCK_H=wh,
+                BLOCK_K=wk,
+                num_warps=wwar,
+                num_stages=wst,
+            )
 
     dx_rows = torch.empty((row_bound, hidden), dtype=x.dtype, device=dev)
     if down_proj_backend == 'cute':
@@ -1290,8 +1334,8 @@ def grouped_moe(
     be multiples of 128, and hidden 128 or a multiple of 256. Returns
     (tokens, hidden), differentiable w.r.t. x, top_weights and all three
     weights. ``down_proj_backend`` picks the gate, up and down projections,
-    input gradients, and down-projection weight gradient: ``'cute'`` uses the
-    Ampere CuTe DSL kernels and ``'triton'`` the Triton ones. The default
+    the SwiGLU backward, input gradients, and weight gradients: ``'cute'``
+    uses the Ampere CuTe DSL kernels and ``'triton'`` the Triton ones. The default
     ``'auto'`` uses CuTe when the ``cute`` extra is installed, the GPU is
     compute capability 8.x, x and the weights are BF16 and hidden is a
     multiple of 256, and Triton otherwise. The remaining kernels always use
